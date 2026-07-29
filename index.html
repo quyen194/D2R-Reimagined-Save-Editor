@@ -16101,6 +16101,14 @@ function renderSharedStashTabs() {
     'onSharedStashSearchInput', ssHits, 'sharedStashJumpToHit'
   );
 
+  // With up to hundreds/thousands of tabs, a swap-status bar pinned to the
+  // bottom of the whole list would land far off-screen from whichever tab
+  // the user just picked. Instead it's inserted right after whichever tab
+  // row was picked *most recently* (the 2nd pick when two are selected).
+  const swapAnchorIdx = (_ssSwapMode && _ssSwapSelection.length > 0)
+    ? _ssSwapSelection[_ssSwapSelection.length - 1]
+    : null;
+
   for (const vt of vtabs) {
     const isOpen = sharedStashOpenTab === vt.id;
     const arrow = isOpen ? '\u25BC' : '\u25B6';
@@ -16149,21 +16157,21 @@ function renderSharedStashTabs() {
     }
 
     html += `</div>`;
-  }
 
-  if (_ssSwapMode && _ssSwapSelection.length > 0) {
-    html += `<div style="margin-top:2px;padding:11px 14px;background:var(--d2-surface3,var(--d2-surface2));border:1px solid var(--d2-gold-dim);border-radius:3px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">`;
-    if (_ssSwapSelection.length === 1) {
-      html += `<div style="font-size:12.5px">${esc(L('ui_ss_swap_pick_second', 'Pick one more regular tab to swap with.'))}</div>`;
-      html += `<button type="button" class="btn" style="margin:0" onclick="cancelSharedStashSwapSelection()">${esc(L('ui_cancel','Cancel'))}</button>`;
-    } else {
-      html += `<div style="font-size:12.5px">${esc(L('ui_ss_swap_ready', 'Two tabs selected — ready to swap.'))}</div>`;
-      html += `<div style="display:flex;gap:8px">`
-            + `<button type="button" class="btn" style="margin:0" onclick="cancelSharedStashSwapSelection()">${esc(L('ui_cancel','Cancel'))}</button>`
-            + `<button type="button" class="btn btn-primary" style="margin:0" onclick="confirmSharedStashSwapSelection()">${esc(L('ui_ss_swap_confirm_btn','Swap'))}</button>`
-            + `</div>`;
+    if (swapAnchorIdx !== null && vt.kind === 'regular' && vt.physicalIdx === swapAnchorIdx) {
+      html += `<div style="margin:-2px 0 8px;padding:11px 14px;background:var(--d2-surface3,var(--d2-surface2));border:1px solid var(--d2-gold-dim);border-radius:3px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">`;
+      if (_ssSwapSelection.length === 1) {
+        html += `<div style="font-size:12.5px">${esc(L('ui_ss_swap_pick_second', 'Pick one more regular tab to swap with.'))}</div>`;
+        html += `<button type="button" class="btn" style="margin:0" onclick="cancelSharedStashSwapSelection()">${esc(L('ui_cancel','Cancel'))}</button>`;
+      } else {
+        html += `<div style="font-size:12.5px">${esc(L('ui_ss_swap_ready', 'Two tabs selected — ready to swap.'))}</div>`;
+        html += `<div style="display:flex;gap:8px">`
+              + `<button type="button" class="btn" style="margin:0" onclick="cancelSharedStashSwapSelection()">${esc(L('ui_cancel','Cancel'))}</button>`
+              + `<button type="button" class="btn btn-primary" style="margin:0" onclick="confirmSharedStashSwapSelection()">${esc(L('ui_ss_swap_confirm_btn','Swap'))}</button>`
+              + `</div>`;
+      }
+      html += `</div>`;
     }
-    html += `</div>`;
   }
 
   container.innerHTML = html;
