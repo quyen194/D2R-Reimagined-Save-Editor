@@ -152,6 +152,8 @@
   .tab.active { color: var(--d2-gold-bright); background: var(--d2-surface3); border-bottom: 2px solid var(--d2-gold); }
   .tab.tab-danger { color: #6b4040; opacity: 0.6; }
   .tab.tab-danger:hover { color: #c06060; opacity: 0.85; background: var(--d2-surface2); }
+  .tab.tab-locked { cursor: not-allowed; opacity: 0.4; }
+  .tab.tab-locked:hover { color: var(--d2-text-dim); background: var(--d2-tab-inactive); }
 
   /* ── Tab content ── */
   .tab-content { flex: 1; padding: 20px; overflow-y: auto; background: var(--d2-bg); position: relative; z-index: 1; }
@@ -1001,6 +1003,18 @@
       </div>
     </div>
     <div id="recentFilesPanel" style="margin-top:12px;max-width:420px;display:none"></div>
+    <div class="ornament" style="margin:6px 0">— ✦ —</div>
+    <div class="upload-sub" id="ssStartSub" style="font-size:13px;max-width:400px">Or manage a Shared Stash without a character save — every other tab stays locked until a .d2s is loaded.</div>
+    <div class="upload-drop-mini" id="ssStartDropZone" style="max-width:420px;margin:10px auto 0"
+      onclick="openSharedStashFromStart()"
+      ondragover="event.preventDefault();this.classList.add('drag-over')"
+      ondragleave="this.classList.remove('drag-over')"
+      ondrop="handleStartSharedStashDrop(event)">
+      <strong id="ssStartDropStrong">Drop your Shared Stash .d2i file here</strong><br>
+      <span id="ssStartDropSub">or click to browse</span>
+    </div>
+    <input type="file" accept=".d2i" id="startSharedStashFileInput" style="display:none"
+      onchange="loadSharedStashFromStart(this.files[0]);this.value=''">
     <div class="ornament">— ✦ —</div>
     <button class="btn btn-primary" style="margin-top:8px;padding:10px 28px;font-size:12px" onclick="openNewCharModal()">Make a New Character</button>
   </div>
@@ -1913,6 +1927,12 @@ function _updateStaticUIStrings() {
   if (dropSub) dropSub.textContent = L('ui_or_browse', 'or click to browse');
   const newCharBtn = document.querySelector('#uploadView .btn-primary');
   if (newCharBtn) newCharBtn.textContent = L('ui_make_new_char', 'Make a New Character');
+  const ssStartSub = el('ssStartSub');
+  if (ssStartSub) ssStartSub.textContent = L('ui_ss_start_sub', 'Or manage a Shared Stash without a character save — every other tab stays locked until a .d2s is loaded.');
+  const ssStartDropStrong = el('ssStartDropStrong');
+  if (ssStartDropStrong) ssStartDropStrong.textContent = L('ui_ss_drop_hint', 'Drop your Shared Stash .d2i file here');
+  const ssStartDropSub = el('ssStartDropSub');
+  if (ssStartDropSub) ssStartDropSub.textContent = L('ui_drop_or_browse', 'or click to browse');
   // New char modal
   const modalTitle = document.querySelector('#newCharModal .modal-title');
   if (modalTitle) modalTitle.textContent = L('ui_create_new_char', 'Create New Character');
@@ -4274,7 +4294,7 @@ function onFileLoaded() {
   snapshotQuestState();
   snapshotSkillState();
   isDirty    = false;
-  inventoryUnlocked = false;  // reset — must re-confirm for each loaded file
+  dangerUnlocked.char = false;  // reset — must re-confirm for each loaded character
   showOnly('editorView');
   updateSaveButton();
   document.getElementById('resetBtn').style.display = '';
@@ -5806,7 +5826,7 @@ window.createNewCharacter = function() {
   snapshotQuestState();
   snapshotSkillState();
   isDirty = true;
-  inventoryUnlocked = false;
+  dangerUnlocked.char = false;
   showOnly('editorView');
   updateSaveButton();
   document.getElementById('resetBtn').style.display = '';
@@ -5826,6 +5846,7 @@ function _doReset() {
   fileName = '';
   isDirty = false;
   activeTab = 'char';
+  clearCharStrip();
 
   // Reset clears the character but doesn't touch vault/grail/shared-stash —
   // so we also drop the undo snapshot (there's nothing coherent left to
@@ -5873,7 +5894,7 @@ function _doReset() {
 
   // Clear all tracked state from the session
   _deletedItemOffsets.clear();
-  inventoryUnlocked = false;
+  dangerUnlocked = { char: false, sharedstash: false, grail: false, vault: false };
   _questsCompletedOnLoad = [[],[],[]];
   _skillsOnLoad = [];
   questActiveDiff = 0;
@@ -5915,7 +5936,7 @@ window.resetEditor = function() {
   for (const k of Object.keys(_autoSaveTimers)) {
     if (_autoSaveTimers[k]) { clearTimeout(_autoSaveTimers[k]); _autoSaveTimers[k] = null; }
   }
-  if (!isDirty) { _doReset(); return; }
+  if (!isAnythingDirty()) { _doReset(); return; }
   showConfirm(L('ui_confirm_unsaved_reset','You have unsaved changes. Are you sure you want to reset?'), _doReset, L('ui_reset','Reset'));
 };
 
@@ -7240,6 +7261,50 @@ window.handleAuxDrop = function(e, kind) {
   }
 };
 
+// Startup-screen Shared Stash browse — same startIn-hint / FSA-handle
+// capture as openAuxFileForKind('sharedStash'), but routes through
+// loadSharedStashFromStart() since no character (and thus no editorView) is
+// loaded yet.
+window.openSharedStashFromStart = async function() {
+  if (window.showOpenFilePicker) {
+    const cfg = AUTOSAVE_PICKER_OPTS.sharedStash;
+    try {
+      const startIn = await getStartInHint();
+      const [handle] = await window.showOpenFilePicker({
+        types: cfg.types,
+        excludeAcceptAllOption: false,
+        multiple: false,
+        startIn,
+      });
+      _fileHandles.sharedStash = handle;
+      await updateStartInHint(handle);
+      const file = await handle.getFile();
+      _lastSeenMtime.sharedStash = file.lastModified || 0;
+      window.loadSharedStashFromStart(file);
+      return;
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      _logCaught('openSharedStashFromStart', e);
+      // fall through to file-input fallback
+    }
+  }
+  _fileHandles.sharedStash = null;
+  const input = document.getElementById('startSharedStashFileInput');
+  if (input) input.click();
+};
+
+// Startup-screen Shared Stash drop zone — mirrors handleDrop() for the main
+// .d2s dropZone.
+window.handleStartSharedStashDrop = function(e) {
+  e.preventDefault();
+  e.stopPropagation();
+  e.currentTarget.classList.remove('drag-over');
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!f) return;
+  _fileHandles.sharedStash = null;
+  window.loadSharedStashFromStart(f);
+};
+
 // Load flow that doubles as auto-save target capture: one picker gives us
 // both the read source and the write handle for the same file. Called from
 // the Advanced Options dialog Load buttons.
@@ -7932,14 +7997,14 @@ async function _reloadKindFromFile(kind, file) {
           return;
         }
       }
-      const wasUnlocked = inventoryUnlocked;
+      const wasUnlocked = dangerUnlocked.char;
       rawBytes   = buf;
       workBytes  = new Uint8Array(buf);
       parsedChar = parseD2S(workBytes);
       try { snapshotQuestState(); snapshotSkillState(); } catch (e) { _logCaught('reload.snapshot', e); }
       _deletedItemOffsets.clear();
       isDirty = false;
-      inventoryUnlocked = wasUnlocked; // don't force the user through the unlock dialog again
+      dangerUnlocked.char = wasUnlocked; // don't force the user through the unlock dialog again
       try { updateCharStrip(); } catch (e) { _logCaught('reload.updateCharStrip', e); }
       try { buildTabs(); renderTab(); } catch (e) { _logCaught('reload.render', e); }
       fileName = file.name;
@@ -8885,6 +8950,19 @@ function clearAllWaypoints(diff) {
 // ═══════════════════════════════════════════════════════════
 //  CHAR STRIP (read from parsedChar)
 // ═══════════════════════════════════════════════════════════
+// Resets the char-strip badge/name/class/level/flags back to their empty
+// placeholder state. Needed because editorView can now be entered without a
+// character loaded (Shared Stash standalone from the startup screen) — a
+// prior session's char strip would otherwise linger stale in the DOM.
+function clearCharStrip() {
+  const classBadge = document.getElementById('classBadge'); if (classBadge) classBadge.textContent = '?';
+  const nameEl = document.getElementById('charNameDisplay'); if (nameEl) nameEl.textContent = '—';
+  const clsEl = document.getElementById('charClassDisplay'); if (clsEl) clsEl.textContent = '—';
+  const lvlEl = document.getElementById('charLevelDisplay'); if (lvlEl) lvlEl.textContent = '—';
+  const diffEl = document.getElementById('charDiffDisplay'); if (diffEl) diffEl.textContent = '—';
+  const flagsEl = document.getElementById('charFlags'); if (flagsEl) flagsEl.innerHTML = '';
+}
+
 function updateCharStrip() {
   if (!parsedChar) return;
   const h   = parsedChar.header;
@@ -9121,21 +9199,45 @@ function getTabs() { return [
   {id:'vault',label:L('ui_tab_vault','Vault'),danger:true},
 ];}
 
-// Inventory/stash item parsing is gated behind an explicit unlock to prevent
-// accidental corruption — the item binary format is not fully verified.
-let inventoryUnlocked = false;
+// Item parsing is gated behind an explicit unlock to prevent accidental
+// corruption — the item binary format is not fully verified. inventory+stash
+// share one flag (both read/write the same loaded character); Shared Stash /
+// Grail / Vault each get their own domain so loading one kind of file (e.g.
+// a .d2s) doesn't force a re-confirmation on a completely different tab that
+// was already unlocked (e.g. an already-open Shared Stash).
+let dangerUnlocked = { char: false, sharedstash: false, grail: false, vault: false };
+function _dangerDomainForTab(tabId) {
+  switch (tabId) {
+    case 'inventory':
+    case 'stash':       return 'char';
+    case 'sharedstash': return 'sharedstash';
+    case 'grail':       return 'grail';
+    case 'vault':       return 'vault';
+    default:            return null;
+  }
+}
 
 function buildTabs() {
   const bar=document.getElementById('tabBar'); bar.innerHTML='';
+  // No .d2s loaded yet (e.g. entered the editor via the startup screen's
+  // Shared Stash .d2i drop) — every char-scoped tab is locked except Shared
+  // Stash itself, which works standalone.
+  const charAvailable = !!parsedChar;
   getTabs().forEach(t=>{
     const b=document.createElement('button');
-    const isDanger = t.danger && !inventoryUnlocked;
-    b.className='tab'+(t.id===activeTab?' active':'')+(isDanger?' tab-danger':'');
+    const isDanger = t.danger && !dangerUnlocked[_dangerDomainForTab(t.id)];
+    const isLocked = !charAvailable && t.id !== 'sharedstash';
+    b.className='tab'+(t.id===activeTab?' active':'')+(isDanger?' tab-danger':'')+(isLocked?' tab-locked':'');
     // Icon is a trusted hardcoded SVG literal; label is user-facing localized text and
     // must be escaped so a translated string with stray markup can't inject into the DOM.
     b.innerHTML=(TAB_ICONS[t.id]||'')+esc(t.label);
-    b.title = isDanger ? L('ui_tab_danger_tooltip','Item editing not currently supported — click to see warning') : '';
+    b.title = isLocked ? L('ui_tab_locked_tooltip','Load a .d2s character file to unlock this tab')
+            : isDanger ? L('ui_tab_danger_tooltip','Item editing not currently supported — click to see warning') : '';
     b.onclick=()=>{
+      if (isLocked) {
+        setStatus(L('ui_tab_locked_status','Load a .d2s character file to unlock this tab.'), 'error');
+        return;
+      }
       // Close any pinned tooltip before the DOM underneath it is thrown away —
       // otherwise _tooltipOpenFrom keeps a stale byteOffset that can collide with
       // a different item's offset on the new tab.
@@ -9151,22 +9253,22 @@ function renderTab() {
     case 'char':      renderChar(c);      break;
     case 'skills':    renderSkills(c);    break;
     case 'inventory':
-      if (!inventoryUnlocked) { renderItemWarning(c, 'inventory'); break; }
+      if (!dangerUnlocked.char) { renderItemWarning(c, 'inventory'); break; }
       renderInventory(c); break;
     case 'stash':
-      if (!inventoryUnlocked) { renderItemWarning(c, 'stash'); break; }
+      if (!dangerUnlocked.char) { renderItemWarning(c, 'stash'); break; }
       renderStash(c);     break;
     case 'sharedstash':
-      if (!inventoryUnlocked) { renderItemWarning(c, 'sharedstash'); break; }
+      if (!dangerUnlocked.sharedstash) { renderItemWarning(c, 'sharedstash'); break; }
       renderSharedStash(c); break;
     case 'quests':    renderQuests(c);    break;
     case 'waypoints': renderWaypoints(c); break;
     case 'mercenary': renderMercenary(c); break;
     case 'grail':
-      if (!inventoryUnlocked) { renderItemWarning(c, 'grail'); break; }
+      if (!dangerUnlocked.grail) { renderItemWarning(c, 'grail'); break; }
       renderGrail(c);     break;
     case 'vault':
-      if (!inventoryUnlocked) { renderItemWarning(c, 'vault'); break; }
+      if (!dangerUnlocked.vault) { renderItemWarning(c, 'vault'); break; }
       renderVault(c);     break;
   }
   // Paint any SpA1 sprite placeholders produced by the tab render. No-op
@@ -9197,7 +9299,8 @@ function renderItemWarning(c, tabId) {
 }
 
 window.unlockItemTab = function(tabId) {
-  inventoryUnlocked = true;
+  const domain = _dangerDomainForTab(tabId);
+  if (domain) dangerUnlocked[domain] = true;
   activeTab = tabId;
   buildTabs();
   renderTab();
@@ -15773,7 +15876,12 @@ window.saveSharedStashFile = function() {
   takeUndoSnapshot();
 };
 
-window.loadSharedStash = function(file) {
+// Shared validation/parse core for every Shared Stash load path (the tab's
+// own Browse/drop, and the standalone startup-screen drop). `onLoaded` runs
+// after sharedStashData/sharedStashParsed are populated — callers own what
+// happens to the UI from there (re-render the tab in place vs. entering the
+// editor for the first time).
+function _loadSharedStashCore(file, onLoaded) {
   if (!file) return;
   const sizeErr = validateSaveFileSize(file);
   if (sizeErr) { showPopup(sizeErr); return; }
@@ -15798,11 +15906,38 @@ window.loadSharedStash = function(file) {
     sharedStashOpenTab = '';
     sharedStashDirty = false;
     parseSharedStash();
+    onLoaded();
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+window.loadSharedStash = function(file) {
+  _loadSharedStashCore(file, () => {
     renderSharedStash(document.getElementById('tabContent'));
     takeUndoSnapshot();
     maybeCaptureAutoSaveHandle('sharedStash');
-  };
-  reader.readAsArrayBuffer(file);
+  });
+};
+
+// Startup-screen entry point — lets the user manage a Shared Stash without
+// ever loading a character save. Enters editorView with every char-scoped
+// tab locked (see buildTabs()) except Shared Stash itself.
+window.loadSharedStashFromStart = function(file) {
+  _loadSharedStashCore(file, () => {
+    dangerUnlocked.sharedstash = false;
+    activeTab = 'sharedstash';
+    showOnly('editorView');
+    document.getElementById('resetBtn').style.display = '';
+    document.querySelectorAll('.fire-side').forEach(el => el.classList.add('active'));
+    updateSaveButton();
+    buildTabs();
+    renderTab();
+    setStatus(Lfmt('ui_status_loaded_sharedstash_only',
+      'Loaded: {file} — load a .d2s character to unlock the other tabs.',
+      { file: sharedStashName }), 'loaded');
+    takeUndoSnapshot();
+    maybeCaptureAutoSaveHandle('sharedStash');
+  });
 };
 
 function parseSharedStash() {

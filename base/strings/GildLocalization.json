@@ -1521,6 +1521,22 @@
         "enUS": "or click to browse"
     },
     {
+        "Key": "ui_ss_start_sub",
+        "enUS": "Or manage a Shared Stash without a character save — every other tab stays locked until a .d2s is loaded."
+    },
+    {
+        "Key": "ui_tab_locked_tooltip",
+        "enUS": "Load a .d2s character file to unlock this tab"
+    },
+    {
+        "Key": "ui_tab_locked_status",
+        "enUS": "Load a .d2s character file to unlock this tab."
+    },
+    {
+        "Key": "ui_status_loaded_sharedstash_only",
+        "enUS": "Loaded: {file} — load a .d2s character to unlock the other tabs."
+    },
+    {
         "Key": "ui_ss_no_file",
         "enUS": "No file loaded"
     },
