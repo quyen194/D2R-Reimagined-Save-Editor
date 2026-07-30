@@ -1004,7 +1004,7 @@
     </div>
     <div id="recentFilesPanel" style="margin-top:12px;max-width:420px;display:none"></div>
     <div class="ornament" style="margin:6px 0">— ✦ —</div>
-    <div class="upload-sub" id="ssStartSub" style="font-size:13px;max-width:400px">Or manage a Shared Stash without a character save — every other tab stays locked until a .d2s is loaded.</div>
+    <div class="upload-sub" id="ssStartSub" style="font-size:13px;max-width:400px">Or manage a Shared Stash, Grail, or Vault without a character save — the character-only tabs stay locked until a .d2s is loaded.</div>
     <div class="upload-drop-mini" id="ssStartDropZone" style="max-width:420px;margin:10px auto 0"
       onclick="openSharedStashFromStart()"
       ondragover="event.preventDefault();this.classList.add('drag-over')"
@@ -1928,7 +1928,7 @@ function _updateStaticUIStrings() {
   const newCharBtn = document.querySelector('#uploadView .btn-primary');
   if (newCharBtn) newCharBtn.textContent = L('ui_make_new_char', 'Make a New Character');
   const ssStartSub = el('ssStartSub');
-  if (ssStartSub) ssStartSub.textContent = L('ui_ss_start_sub', 'Or manage a Shared Stash without a character save — every other tab stays locked until a .d2s is loaded.');
+  if (ssStartSub) ssStartSub.textContent = L('ui_ss_start_sub', 'Or manage a Shared Stash, Grail, or Vault without a character save — the character-only tabs stay locked until a .d2s is loaded.');
   const ssStartDropStrong = el('ssStartDropStrong');
   if (ssStartDropStrong) ssStartDropStrong.textContent = L('ui_ss_drop_hint', 'Drop your Shared Stash .d2i file here');
   const ssStartDropSub = el('ssStartDropSub');
@@ -9217,16 +9217,20 @@ function _dangerDomainForTab(tabId) {
   }
 }
 
+// Tabs that read/write their own standalone .d2i file and don't need a
+// loaded character — reachable even when entering the editor via the
+// startup screen's Shared Stash drop (see loadSharedStashFromStart()).
+const STANDALONE_TABS = new Set(['sharedstash', 'grail', 'vault']);
+
 function buildTabs() {
   const bar=document.getElementById('tabBar'); bar.innerHTML='';
-  // No .d2s loaded yet (e.g. entered the editor via the startup screen's
-  // Shared Stash .d2i drop) — every char-scoped tab is locked except Shared
-  // Stash itself, which works standalone.
+  // No .d2s loaded yet — every char-scoped tab is locked except the
+  // standalone .d2i tabs (Shared Stash / Grail / Vault).
   const charAvailable = !!parsedChar;
   getTabs().forEach(t=>{
     const b=document.createElement('button');
     const isDanger = t.danger && !dangerUnlocked[_dangerDomainForTab(t.id)];
-    const isLocked = !charAvailable && t.id !== 'sharedstash';
+    const isLocked = !charAvailable && !STANDALONE_TABS.has(t.id);
     b.className='tab'+(t.id===activeTab?' active':'')+(isDanger?' tab-danger':'')+(isLocked?' tab-locked':'');
     // Icon is a trusted hardcoded SVG literal; label is user-facing localized text and
     // must be escaped so a translated string with stray markup can't inject into the DOM.
@@ -15921,7 +15925,8 @@ window.loadSharedStash = function(file) {
 
 // Startup-screen entry point — lets the user manage a Shared Stash without
 // ever loading a character save. Enters editorView with every char-scoped
-// tab locked (see buildTabs()) except Shared Stash itself.
+// tab locked (see buildTabs()) except the standalone .d2i tabs (Shared
+// Stash, Grail, Vault).
 window.loadSharedStashFromStart = function(file) {
   _loadSharedStashCore(file, () => {
     dangerUnlocked.sharedstash = false;
@@ -15933,7 +15938,7 @@ window.loadSharedStashFromStart = function(file) {
     buildTabs();
     renderTab();
     setStatus(Lfmt('ui_status_loaded_sharedstash_only',
-      'Loaded: {file} — load a .d2s character to unlock the other tabs.',
+      'Loaded: {file} — Grail and Vault are also available; load a .d2s character to unlock the rest.',
       { file: sharedStashName }), 'loaded');
     takeUndoSnapshot();
     maybeCaptureAutoSaveHandle('sharedStash');
@@ -19130,6 +19135,19 @@ function getVaultSourceView() {
   return null;
 }
 
+// vaultSource.kind's static initial value ('inventory') is only valid once a
+// character is loaded — reached directly whenever the Vault tab is opened
+// without one (e.g. the D2I-only startup flow). Keeps the current kind if
+// it's still available; otherwise falls back to the first available option
+// in dropdown order (inventory → stash → sharedStash).
+function _pickValidVaultSourceKind(kind, charLoaded, sharedLoaded) {
+  const available = { inventory: charLoaded, stash: charLoaded, sharedStash: sharedLoaded };
+  if (available[kind]) return kind;
+  if (charLoaded) return 'inventory';
+  if (sharedLoaded) return 'sharedStash';
+  return kind; // nothing available at all — leave as-is, dropdown is fully disabled
+}
+
 // Look up a source item by its byteOffset across the possible sources, so the
 // tooltip can find an item regardless of which source the user is currently viewing.
 function findVaultSourceItem(byteOffset) {
@@ -20061,9 +20079,14 @@ function renderVault(c) {
     : vaultItems.filter(it => it.pageId === vaultActivePage && _vaultItemIsTopLevel(it)).length;
 
   // ── Source panel HTML ──
-  const srcView = getVaultSourceView();
   const charLoaded = !!(parsedChar && parsedChar.items);
   const sharedLoaded = !!sharedStashParsed;
+  // 'inventory' is vaultSource's static initial value, which is invalid
+  // whenever the Vault tab is reached without a character loaded (e.g. the
+  // D2I-only startup flow). Swap to the first actually-available source
+  // instead of rendering a disabled option with an empty source panel.
+  vaultSource.kind = _pickValidVaultSourceKind(vaultSource.kind, charLoaded, sharedLoaded);
+  const srcView = getVaultSourceView();
 
   const srcDropdown = `
     <select onchange="vaultSelectSource(this.value)"

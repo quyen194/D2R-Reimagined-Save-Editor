@@ -1522,7 +1522,7 @@
     },
     {
         "Key": "ui_ss_start_sub",
-        "enUS": "Or manage a Shared Stash without a character save — every other tab stays locked until a .d2s is loaded."
+        "enUS": "Or manage a Shared Stash, Grail, or Vault without a character save — the character-only tabs stay locked until a .d2s is loaded."
     },
     {
         "Key": "ui_tab_locked_tooltip",
@@ -1534,7 +1534,7 @@
     },
     {
         "Key": "ui_status_loaded_sharedstash_only",
-        "enUS": "Loaded: {file} — load a .d2s character to unlock the other tabs."
+        "enUS": "Loaded: {file} — Grail and Vault are also available; load a .d2s character to unlock the rest."
     },
     {
         "Key": "ui_ss_no_file",
