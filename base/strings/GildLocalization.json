@@ -1513,6 +1513,14 @@
         "enUS": "Browse .d2i"
     },
     {
+        "Key": "ui_ss_drop_hint",
+        "enUS": "Drop your Shared Stash .d2i file here"
+    },
+    {
+        "Key": "ui_drop_or_browse",
+        "enUS": "or click to browse"
+    },
+    {
         "Key": "ui_ss_no_file",
         "enUS": "No file loaded"
     },
@@ -1551,6 +1559,10 @@
     {
         "Key": "ui_grail_load_btn",
         "enUS": "Load Grail .d2i"
+    },
+    {
+        "Key": "ui_grail_drop_hint",
+        "enUS": "Drop your Grail .d2i file here"
     },
     {
         "Key": "ui_grail_copy_items_btn",

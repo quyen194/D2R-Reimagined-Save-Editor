@@ -118,6 +118,10 @@
   .upload-drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
   .upload-drop-text { font-family: 'Cinzel', serif; font-size: 13px; letter-spacing: 1px; color: var(--d2-text-dim); pointer-events: none; }
   .upload-drop-text strong { color: var(--d2-gold); font-weight: 600; }
+  .upload-drop-mini { border: 1px dashed var(--d2-border-bright); border-radius: 2px; padding: 14px 20px; text-align: center; cursor: pointer; transition: all 0.2s; background: var(--d2-surface2); margin-bottom: 16px; }
+  .upload-drop-mini:hover, .upload-drop-mini.drag-over { border-color: var(--d2-gold); background: var(--d2-surface3); }
+  .upload-drop-mini strong { font-family: 'Cinzel', serif; font-size: 12px; letter-spacing: 0.5px; color: var(--d2-gold); font-weight: 600; }
+  .upload-drop-mini span { font-size: 12px; color: var(--d2-text-dim); }
   .ornament { color: var(--d2-gold-dim); font-size: 22px; letter-spacing: 8px; }
 
   /* ── Editor view ── */
@@ -4345,6 +4349,21 @@ async function storeRecentFileHandle(name, handle) {
   } catch (e) { /* best-effort: IndexedDB unavailable or quota exceeded */ }
 }
 
+// Records a handle as the "last opened" location without polluting the
+// by-name recent-files map — used by pickers (vault/grail/shared-stash)
+// that shouldn't show up in the character "recent files" list but should
+// still steer the *next* picker (of any kind) to the same folder.
+async function updateStartInHint(handle) {
+  if (!handle) return;
+  _lastUsedFileHandle = handle;
+  try {
+    if (window.indexedDB) {
+      const db = await openRecentDB();
+      db.transaction('handles', 'readwrite').objectStore('handles').put(handle, '__lastUsed__');
+    }
+  } catch (e) { /* best-effort: IndexedDB unavailable or quota exceeded */ }
+}
+
 async function getStartInHint() {
   // Prefer the last-used file handle (browser opens its directory)
   if (_lastUsedFileHandle) return _lastUsedFileHandle;
@@ -7170,12 +7189,15 @@ window.openAuxFileForKind = async function(kind) {
     const cfg = AUTOSAVE_PICKER_OPTS[kind];
     if (cfg) {
       try {
+        const startIn = await getStartInHint();
         const [handle] = await window.showOpenFilePicker({
           types: cfg.types,
           excludeAcceptAllOption: false,
           multiple: false,
+          startIn,
         });
         _fileHandles[kind] = handle;
+        await updateStartInHint(handle);
         const file = await handle.getFile();
         _lastSeenMtime[kind] = file.lastModified || 0;
         switch (kind) {
@@ -7200,6 +7222,24 @@ window.openAuxFileForKind = async function(kind) {
   if (input) input.click();
 };
 
+// Drop handler for the vault/grail/shared-stash mini drop-zones. Mirrors
+// handleDrop() for the main .d2s dropZone: file-input/drag-drop gives us a
+// File but no FileSystemFileHandle, so any rehydrated handle for this kind
+// is cleared to avoid auto-save silently writing to the wrong folder.
+window.handleAuxDrop = function(e, kind) {
+  e.preventDefault();
+  e.stopPropagation();
+  e.currentTarget.classList.remove('drag-over');
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!f) return;
+  _fileHandles[kind] = null;
+  switch (kind) {
+    case 'vault':       window.loadVaultFile(f); break;
+    case 'grail':       window.loadGrailFile(f); break;
+    case 'sharedStash': window.loadSharedStash(f); break;
+  }
+};
+
 // Load flow that doubles as auto-save target capture: one picker gives us
 // both the read source and the write handle for the same file. Called from
 // the Advanced Options dialog Load buttons.
@@ -7208,11 +7248,14 @@ window.loadFileForAutoSave = async function(kind) {
   const cfg = AUTOSAVE_PICKER_OPTS[kind];
   if (!cfg) return;
   try {
+    const startIn = await getStartInHint();
     const [handle] = await window.showOpenFilePicker({
       types: cfg.types,
       excludeAcceptAllOption: false,
       multiple: false,
+      startIn,
     });
+    await updateStartInHint(handle);
     const file = await handle.getFile();
     // Store handle as auto-save target BEFORE dispatching the loader, so
     // when the load's maybeCaptureAutoSaveHandle fires it sees a matching
@@ -15702,6 +15745,14 @@ function renderSharedStash(c) {
           ${sharedStashData ? esc(sharedStashName) + ' (' + sharedStashData.length + ' bytes)' : esc(L('ui_ss_no_file','No file loaded'))}
         </span>
       </div>
+      <div class="upload-drop-mini"
+        onclick="openAuxFileForKind('sharedStash')"
+        ondragover="event.preventDefault();this.classList.add('drag-over')"
+        ondragleave="this.classList.remove('drag-over')"
+        ondrop="handleAuxDrop(event,'sharedStash')">
+        <strong>${esc(L('ui_ss_drop_hint','Drop your Shared Stash .d2i file here'))}</strong><br>
+        <span>${esc(L('ui_drop_or_browse','or click to browse'))}</span>
+      </div>
       <div id="sharedStashContent">${sharedStashData ? '' : `<div style="color:var(--d2-text-dim);font-style:italic">${esc(L('ui_ss_empty','No shared stash loaded.'))}</div>`}</div>
     </div>`;
   if (sharedStashData) renderSharedStashTabs();
@@ -17251,6 +17302,14 @@ function renderGrail(c) {
       <input type="file" accept=".d2i" id="grailFileInput" style="display:none" onchange="loadGrailFile(this.files[0])">
       <button class="btn btn-primary" onclick="moveItemsToGrail()">${esc(L('ui_grail_copy_items_btn','Copy Items to Grail'))}</button>
       <span style="color:var(--d2-text-dim);font-size:12px">${grailD2i ? esc(grailFileName) : esc(L('ui_grail_no_loaded','No grail loaded'))}</span>
+    </div>
+    <div class="upload-drop-mini"
+      onclick="openAuxFileForKind('grail')"
+      ondragover="event.preventDefault();this.classList.add('drag-over')"
+      ondragleave="this.classList.remove('drag-over')"
+      ondrop="handleAuxDrop(event,'grail')">
+      <strong>${esc(L('ui_grail_drop_hint','Drop your Grail .d2i file here'))}</strong><br>
+      <span>${esc(L('ui_drop_or_browse','or click to browse'))}</span>
     </div>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;flex-wrap:wrap">
       <button class="btn btn-primary" onclick="saveGrailFile()" ${grailD2i ? '' : 'disabled'}>${esc(L('ui_grail_save_btn','Save Grail .d2i'))}</button>
@@ -19911,6 +19970,14 @@ function renderVault(c) {
         <button class="btn btn-primary" onclick="openAuxFileForKind('vault')">${esc(L('ui_vault_load_btn','Load Vault .d2i'))}</button>
         <input type="file" accept=".d2i" id="vaultFileInput" style="display:none" onchange="loadVaultFile(this.files[0])">
         <span style="color:var(--d2-text-dim);font-size:12px;flex:1">${fileInfo}</span>
+      </div>
+      <div class="upload-drop-mini" style="max-width:760px"
+        onclick="openAuxFileForKind('vault')"
+        ondragover="event.preventDefault();this.classList.add('drag-over')"
+        ondragleave="this.classList.remove('drag-over')"
+        ondrop="handleAuxDrop(event,'vault')">
+        <strong>${esc(L('ui_vault_drop_hint','Drop your Vault .d2i file here'))}</strong><br>
+        <span>${esc(L('ui_drop_or_browse','or click to browse'))}</span>
       </div>
       <div style="margin-bottom:14px;padding:10px 14px;max-width:760px;border-left:3px solid var(--d2-gold);background:rgba(200,160,48,0.06);font-size:12px;color:var(--d2-text-dim);line-height:1.55">
         ${esc(L('ui_vault_tip','Only a Vault.d2i file is needed on this page. The source panel pulls items from a character / shared stash if loaded on their own tabs, but the vault itself works standalone — drag items between the source and the grid, switch pages on the right, save when done.'))}
