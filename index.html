@@ -16738,13 +16738,18 @@ function _ssTypeChainHas(item, types) {
 // the FIRST bucket its type chain matches, so specific buckets must precede
 // the general ones ('axe' before the 'weap' catch-all). Quivers sit directly
 // behind the launcher they feed: arrows after bows, bolts after crossbows.
+//
+// `slot` splits armor from weapons: armor sorts as one block in the order
+// listed here, weapons then split again by hand count (see _ssHandTier), so a
+// bucket like 'axe' or 'swor' can show up twice — hand axes with the one-handed
+// weapons, great axes with the two-handed ones.
 const SS_GEAR_GROUPS = [
-  { key: 'helm', label: 'Helms',         types: ['helm'] },
-  { key: 'tors', label: 'Body Armor',    types: ['tors'] },
-  { key: 'shld', label: 'Shields',       types: ['shld'] },
-  { key: 'belt', label: 'Belts',         types: ['belt'] },
-  { key: 'glov', label: 'Gloves',        types: ['glov'] },
-  { key: 'boot', label: 'Boots',         types: ['boot'] },
+  { key: 'helm', label: 'Helms',         types: ['helm'], slot: 'armor' },
+  { key: 'tors', label: 'Body Armor',    types: ['tors'], slot: 'armor' },
+  { key: 'belt', label: 'Belts',         types: ['belt'], slot: 'armor' },
+  { key: 'glov', label: 'Gloves',        types: ['glov'], slot: 'armor' },
+  { key: 'boot', label: 'Boots',         types: ['boot'], slot: 'armor' },
+  { key: 'shld', label: 'Shields',       types: ['shld'], slot: 'armor' },
   { key: 'axe',  label: 'Axes',          types: ['axe'] },
   { key: 'swor', label: 'Swords',        types: ['swor'] },
   { key: 'knif', label: 'Knives',        types: ['knif'] },
@@ -16782,6 +16787,21 @@ function _ssGearGroupIndex(item) {
     if (_ssTypeChainHas(item, SS_GEAR_GROUPS[i].types)) return i;
   }
   return SS_GEAR_GROUPS.length;
+}
+
+// Coarser key that runs AHEAD of the bucket index: all armor first, then every
+// one-handed weapon, then every two-handed one. Hand count comes from
+// weapons.txt's '2handed' column (IS_2HANDED), so a sword flagged 1or2handed
+// counts as one-handed — same as the character sheet treats it. Quivers hold no
+// hand at all but ride along with the launcher they feed, hence the explicit 2.
+// Anything typed but unbucketed stays dead last, as it did before.
+function _ssHandTier(item) {
+  const group = SS_GEAR_GROUPS[_ssGearGroupIndex(item)];
+  if (!group) return 3;
+  if (group.slot === 'armor') return 0;
+  if (IS_2HANDED.has(item.typeCode || '')) return 2;
+  if (_ssTypeChainHas(item, ['bowq', 'xboq'])) return 2;
+  return 1;
 }
 
 // Highest levelreq across an item's rolled affixes. This is the only source of
@@ -16824,7 +16844,7 @@ function _ssItemSortLevel(item) {
   return affix > lvl ? affix : lvl;
 }
 
-// Crafted (q=8) sorts ahead of rare (q=6) inside each group.
+// Crafted (q=8) sorts ahead of unique (q=7) inside each group.
 function _ssQualityRank(item) { return item.quality === 8 ? 0 : 1; }
 
 // Item level, negated so a plain ascending comparison puts the HIGHEST ilvl
@@ -16834,7 +16854,10 @@ function _ssIlvlDesc(item) { return -(item.itemLevel || 0); }
 
 function _ssBaseName(item) { return itemNameFromCode(item.typeCode || ''); }
 
-const _ssIsRareLike = (it) => it.quality === 6 || it.quality === 8;
+// Crafted rides with unique rather than with rare: both are one-off drops the
+// user hoards, and crafted takes the front of the pair via _ssQualityRank.
+const _ssIsRare = (it) => it.quality === 6;
+const _ssIsUniqueLike = (it) => it.quality === 7 || it.quality === 8;
 
 // ── Sort mode registry ──────────────────────────────────────
 //
@@ -16859,35 +16882,38 @@ const SS_SORT_MODES = [
   },
   {
     id: 'uniqueGear',
-    label: () => L('ui_ss_mode_unique_gear', 'Unique Items'),
-    hint:  () => L('ui_ss_mode_gear_hint', 'By slot (helm, armor, shield, belt, gloves, boots, weapons), then required level.'),
-    noun:  () => L('ui_ss_noun_unique', 'unique items'),
+    label: () => L('ui_ss_mode_unique_gear', 'Crafted & Unique Items'),
+    hint:  () => L('ui_ss_mode_gear_hint', 'By slot (helm, armor, belt, gloves, boots, shield, one-handed then two-handed weapons), then required level.'),
+    noun:  () => L('ui_ss_noun_unique', 'crafted & unique items'),
     streams: [{
-      match: (it) => it.quality === 7 && _ssIsGearItem(it),
+      match: (it) => _ssIsUniqueLike(it) && _ssIsGearItem(it),
       dir: 'row',
-      key: (it) => [_ssGearGroupIndex(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+      key: (it) => [_ssHandTier(it), _ssGearGroupIndex(it), _ssQualityRank(it),
+                    _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
     }],
   },
   {
     id: 'rareGear',
     label: () => L('ui_ss_mode_rare_gear', 'Rare Items'),
-    hint:  () => L('ui_ss_mode_gear_hint', 'By slot (helm, armor, shield, belt, gloves, boots, weapons), then required level.'),
+    hint:  () => L('ui_ss_mode_gear_hint', 'By slot (helm, armor, belt, gloves, boots, shield, one-handed then two-handed weapons), then required level.'),
     noun:  () => L('ui_ss_noun_rare', 'rare items'),
     streams: [{
-      match: (it) => _ssIsRareLike(it) && _ssIsGearItem(it),
+      match: (it) => _ssIsRare(it) && _ssIsGearItem(it),
       dir: 'row',
-      key: (it) => [_ssGearGroupIndex(it), _ssQualityRank(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+      key: (it) => [_ssHandTier(it), _ssGearGroupIndex(it), _ssItemSortLevel(it),
+                    _ssIlvlDesc(it), _ssBaseName(it)],
     }],
   },
   {
     id: 'uniqueCharm',
-    label: () => L('ui_ss_mode_unique_charm', 'Unique Charms'),
+    label: () => L('ui_ss_mode_unique_charm', 'Crafted & Unique Charms'),
     hint:  () => L('ui_ss_mode_charm_hint', 'Grand charms first, then large, then small — each by required level.'),
-    noun:  () => L('ui_ss_noun_unique_charm', 'unique charms'),
+    noun:  () => L('ui_ss_noun_unique_charm', 'crafted & unique charms'),
     streams: [{
-      match: (it) => it.quality === 7 && _ssTypeChainHas(it, ['char', 'torc']),
+      match: (it) => _ssIsUniqueLike(it) && _ssTypeChainHas(it, ['char', 'torc']),
       dir: 'row',
-      key: (it) => [-getItemSize(it.typeCode).h, _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+      key: (it) => [-getItemSize(it.typeCode).h, _ssQualityRank(it),
+                    _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
     }],
   },
   {
@@ -16903,13 +16929,13 @@ const SS_SORT_MODES = [
   },
   {
     id: 'uniqueJewel',
-    label: () => L('ui_ss_mode_unique_jewel', 'Unique Jewels'),
+    label: () => L('ui_ss_mode_unique_jewel', 'Crafted & Unique Jewels'),
     hint:  () => L('ui_ss_mode_jewel_hint', 'By required level.'),
-    noun:  () => L('ui_ss_noun_unique_jewel', 'unique jewels'),
+    noun:  () => L('ui_ss_noun_unique_jewel', 'crafted & unique jewels'),
     streams: [{
-      match: (it) => it.quality === 7 && _ssTypeChainHas(it, ['jewl']),
+      match: (it) => _ssIsUniqueLike(it) && _ssTypeChainHas(it, ['jewl']),
       dir: 'row',
-      key: (it) => [_ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+      key: (it) => [_ssQualityRank(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
     }],
   },
   {
@@ -16919,9 +16945,9 @@ const SS_SORT_MODES = [
     noun:  () => L('ui_ss_noun_rare_magic_jewel', 'rare/magic jewels'),
     streams: [
       {
-        match: (it) => _ssIsRareLike(it) && _ssTypeChainHas(it, ['jewl']),
+        match: (it) => _ssIsRare(it) && _ssTypeChainHas(it, ['jewl']),
         dir: 'colL',
-        key: (it) => [_ssQualityRank(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+        key: (it) => [_ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
       },
       {
         match: (it) => it.quality === 4 && _ssTypeChainHas(it, ['jewl']),
@@ -16937,12 +16963,12 @@ const SS_SORT_MODES = [
 // the left edge, amulets from the right, so the two never interleave.
 function _ssRingAmuletModes() {
   const defs = [
-    { id: 'uniqueRingAmu', labelKey: 'ui_ss_mode_unique_ringamu', labelDef: 'Unique Rings & Amulets',
-      nounKey: 'ui_ss_noun_unique_ringamu', nounDef: 'unique rings & amulets',
-      match: (it) => it.quality === 7, ranked: false },
+    { id: 'uniqueRingAmu', labelKey: 'ui_ss_mode_unique_ringamu', labelDef: 'Crafted & Unique Rings & Amulets',
+      nounKey: 'ui_ss_noun_unique_ringamu', nounDef: 'crafted & unique rings & amulets',
+      match: _ssIsUniqueLike, ranked: true },
     { id: 'rareRingAmu',   labelKey: 'ui_ss_mode_rare_ringamu',   labelDef: 'Rare Rings & Amulets',
       nounKey: 'ui_ss_noun_rare_ringamu', nounDef: 'rare rings & amulets',
-      match: _ssIsRareLike, ranked: true },
+      match: _ssIsRare, ranked: false },
     { id: 'magicRingAmu',  labelKey: 'ui_ss_mode_magic_ringamu',  labelDef: 'Magic Rings & Amulets',
       nounKey: 'ui_ss_noun_magic_ringamu', nounDef: 'magic rings & amulets',
       match: (it) => it.quality === 4, ranked: false },
