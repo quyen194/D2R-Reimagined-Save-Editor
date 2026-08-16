@@ -16302,7 +16302,12 @@ function swapSharedStashTabs(idxA, idxB) {
   if (idxA > idxB) { const tmp = idxA; idxA = idxB; idxB = tmp; }
 
   const sectionStart = (i) => tabs[i].jmOff - 0x40;
-  const payloadEnd = (i) => (i + 1 < tabs.length) ? sectionStart(i + 1) : sharedStashData.length;
+  // The last tab stops at its own stored section length, never at EOF: a real
+  // file can carry further pages past the last JM-bearing one, and the JM scan
+  // cannot see them (Reimagined ships a trailing pageType=2 page with no "JM"
+  // marker). Taking EOF here spliced that page into the other tab's item
+  // payload, which the game client rejects. _ssPayloadEnd knows the boundary.
+  const payloadEnd = (i) => (i + 1 < tabs.length) ? sectionStart(i + 1) : _ssPayloadEnd(i);
 
   const A = tabs[idxA], B = tabs[idxB];
   const aFrom = A.jmOff + 2, aTo = payloadEnd(idxA); // count field + item payload
