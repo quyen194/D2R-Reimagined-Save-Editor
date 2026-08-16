@@ -2204,7 +2204,8 @@ function buildMagicAffixModTables() {
       const mods = _parseMagicMods(row);
       const filt = _parseAffixTypeFilters(row);
       if (name || mods.length) {
-        MAGIC_PREFIX_MODS[id] = { name: stringTable[name] || name, mods, itypes: filt.itypes, etypes: filt.etypes };
+        MAGIC_PREFIX_MODS[id] = { name: stringTable[name] || name, mods, itypes: filt.itypes, etypes: filt.etypes,
+                                  levelreq: parseInt(row['levelreq'] || '0', 10) || 0 };
       }
     });
     console.log(`buildMagicAffixModTables: ${Object.keys(MAGIC_PREFIX_MODS).length} prefix mod entries`);
@@ -2217,7 +2218,8 @@ function buildMagicAffixModTables() {
       const mods = _parseMagicMods(row);
       const filt = _parseAffixTypeFilters(row);
       if (name || mods.length) {
-        MAGIC_SUFFIX_MODS[id] = { name: stringTable[name] || name, mods, itypes: filt.itypes, etypes: filt.etypes };
+        MAGIC_SUFFIX_MODS[id] = { name: stringTable[name] || name, mods, itypes: filt.itypes, etypes: filt.etypes,
+                                  levelreq: parseInt(row['levelreq'] || '0', 10) || 0 };
       }
     });
     console.log(`buildMagicAffixModTables: ${Object.keys(MAGIC_SUFFIX_MODS).length} suffix mod entries`);
@@ -16392,16 +16394,19 @@ window.confirmSharedStashSwapSelection = function() {
 };
 
 // ═══════════════════════════════════════════════════════════
-//  SHARED STASH — SORT SET ITEMS
-//  Groups set items scattered across tabs by their parent set (e.g. every
-//  "Tal Rasha's Wrappings" piece, regardless of which tab it started in),
-//  sorts sets alphabetically, and repacks them into one or more tabs the
-//  user picks. Two phases: a pure in-memory simulation (_ssPlanSort) that
-//  can be re-run cheaply while the user picks tabs, then a byte-level apply
+//  SHARED STASH — SORT ITEMS
+//  Collects items scattered across tabs, orders them by whichever rule the
+//  chosen sort mode defines, and repacks them into one or more tabs the user
+//  picks. Two phases: a pure in-memory simulation (_ssPlanSort) that can be
+//  re-run cheaply while the user picks tabs, then a byte-level apply
 //  (_ssApplySortPlan) that mutates sharedStashData once the plan is final.
+//
+//  Mode 'set' keeps its original behaviour (whole sets stay together and get
+//  a tab atomically). Every other mode is a flat ordered stream — see
+//  SS_SORT_MODES below.
 // ═══════════════════════════════════════════════════════════
 let _ssSortState = null;
-// { step:1|2, sourceSel:Set<physicalIdx>, sourceFilter, targetFilter,
+// { step:0|1|2, modeId, sourceSel:Set<physicalIdx>, sourceFilter, targetFilter,
 //   targetOrder:[physicalIdx,...], pendingReason:null|{setGroup} }
 
 let _ssSetGroupMapCache = null;
@@ -16417,6 +16422,279 @@ function _ssSetGroupMap() {
   }
   _ssSetGroupMapCache = map;
   return map;
+}
+
+// ── Item classification for the non-set sort modes ──────────
+//
+// Everything below reads only fields decodeItemProperties fills in before it
+// walks the property list (quality, uniqueId, setId, _prefixId/_suffixId,
+// _rareAffixes). That part of the bit stream is reliable; the property list
+// itself desyncs often — see _ssItemTrueLength — so no sort key depends on it.
+
+// True when `types` intersects the item's itemtypes.txt Equiv chain, so a
+// circlet (circ → helm → armo) answers yes to 'helm' and a throwing axe
+// (taxe → comb + axe) answers yes to 'axe'.
+function _ssTypeChainHas(item, types) {
+  const baseType = ITEM_TYPE_BY_CODE[item.typeCode || ''] || '';
+  if (!baseType) return false;
+  const chain = ITEM_ITYPE_CHAIN[baseType] || new Set([baseType]);
+  for (const t of types) if (chain.has(t)) return true;
+  return false;
+}
+
+// Ordered equipment buckets for the unique/rare gear sorts. An item lands in
+// the FIRST bucket its type chain matches, so specific buckets must precede
+// the general ones ('axe' before the 'weap' catch-all). Quivers sit directly
+// behind the launcher they feed: arrows after bows, bolts after crossbows.
+const SS_GEAR_GROUPS = [
+  { key: 'helm', label: 'Helms',         types: ['helm'] },
+  { key: 'tors', label: 'Body Armor',    types: ['tors'] },
+  { key: 'shld', label: 'Shields',       types: ['shld'] },
+  { key: 'belt', label: 'Belts',         types: ['belt'] },
+  { key: 'glov', label: 'Gloves',        types: ['glov'] },
+  { key: 'boot', label: 'Boots',         types: ['boot'] },
+  { key: 'axe',  label: 'Axes',          types: ['axe'] },
+  { key: 'swor', label: 'Swords',        types: ['swor'] },
+  { key: 'knif', label: 'Knives',        types: ['knif'] },
+  // Explicit club/mace/hamm rather than their shared 'blun' parent: staves and
+  // scepters inherit 'blun' through 'rod' and belong in their own buckets.
+  { key: 'blun', label: 'Clubs & Maces', types: ['club', 'mace', 'hamm'] },
+  { key: 'scep', label: 'Scepters',      types: ['scep'] },
+  { key: 'wand', label: 'Wands',         types: ['wand'] },
+  { key: 'staf', label: 'Staves',        types: ['staf'] },
+  { key: 'orb',  label: 'Orbs',          types: ['orb'] },
+  { key: 'spea', label: 'Spears',        types: ['spea'] },
+  { key: 'pole', label: 'Polearms',      types: ['pole'] },
+  { key: 'jave', label: 'Javelins',      types: ['jave'] },
+  { key: 'bow',  label: 'Bows',          types: ['bow'] },
+  { key: 'bowq', label: 'Arrows',        types: ['bowq'] },
+  { key: 'xbow', label: 'Crossbows',     types: ['xbow'] },
+  { key: 'xboq', label: 'Bolts',         types: ['xboq'] },
+  { key: 'h2h',  label: 'Claws',         types: ['h2h'] },
+  { key: 'weap', label: 'Other Weapons', types: ['weap'] },
+];
+
+// Charms / jewels / rings / amulets / socket fillers have their own sort
+// modes, so the gear sorts must never sweep them up.
+const SS_NON_GEAR_TYPES = ['char', 'torc', 'jewl', 'ring', 'amul', 'gem', 'sock'];
+
+function _ssIsGearItem(item) {
+  if (_ssTypeChainHas(item, SS_NON_GEAR_TYPES)) return false;
+  return !!ITEM_TYPE_BY_CODE[item.typeCode || ''];
+}
+
+// Bucket index used as the primary gear sort key. Anything typed but
+// unmatched (an oddball mod type) sorts after every named bucket.
+function _ssGearGroupIndex(item) {
+  for (let i = 0; i < SS_GEAR_GROUPS.length; i++) {
+    if (_ssTypeChainHas(item, SS_GEAR_GROUPS[i].types)) return i;
+  }
+  return SS_GEAR_GROUPS.length;
+}
+
+// Highest levelreq across an item's rolled affixes. This is the only source of
+// a required level for charms and jewels — their base rows list levelreq 0 —
+// so it has to come from magicprefix/magicsuffix.txt. Rare/crafted items store
+// up to 6 affixes; slots 0-2 index the prefix table, 3-5 the suffix table
+// (same convention resolveRareMods uses).
+function _ssAffixLevelReq(item) {
+  let lvl = 0;
+  const bump = (table, id) => {
+    const e = id ? table[id] : null;
+    if (e && e.levelreq > lvl) lvl = e.levelreq;
+  };
+  bump(MAGIC_PREFIX_MODS, item._prefixId);
+  bump(MAGIC_SUFFIX_MODS, item._suffixId);
+  for (const a of (item._rareAffixes || [])) {
+    bump(a.slot < 3 ? MAGIC_PREFIX_MODS : MAGIC_SUFFIX_MODS, a.id);
+  }
+  return lvl;
+}
+
+// Required level for sorting: the base item's own levelreq raised by whatever
+// the item's quality adds (uniqueitems/setitems 'lvl req', or affix levelreq).
+// Mirrors _itemEquipReqs' rules but stays separate from it — that one drives
+// tooltips and deliberately ignores affixes.
+function _ssItemSortLevel(item) {
+  const base = ITEM_REQS_BY_CODE[item.typeCode || ''] || {};
+  let lvl = base.levelreq || 0;
+  if (item.quality === 7 && item.uniqueId !== undefined && item.uniqueId !== null) {
+    const row = UNIQUE_ROW_BY_ID[item.uniqueId];
+    const v = parseInt((row && row['lvl req']) || '0', 10);
+    if (v > lvl) lvl = v;
+  } else if (item.quality === 5) {
+    const sid = item.setId !== undefined ? item.setId : item.setItemId;
+    const row = (sid !== undefined && sid !== null) ? SET_ROW_BY_ID[sid] : null;
+    const v = parseInt((row && row['lvl req']) || '0', 10);
+    if (v > lvl) lvl = v;
+  }
+  const affix = _ssAffixLevelReq(item);
+  return affix > lvl ? affix : lvl;
+}
+
+// Crafted (q=8) sorts ahead of rare (q=6) inside each group.
+function _ssQualityRank(item) { return item.quality === 8 ? 0 : 1; }
+
+function _ssBaseName(item) { return itemNameFromCode(item.typeCode || ''); }
+
+const _ssIsRareLike = (it) => it.quality === 6 || it.quality === 8;
+
+// ── Sort mode registry ──────────────────────────────────────
+//
+// Each mode declares one or two independent streams. A stream is a filter, a
+// fill direction, and a sort key; two-stream modes are the "grows from both
+// edges" layouts (rings from the left column, amulets from the right).
+//
+//   dir 'row'  — row-major, left to right, top to bottom
+//   dir 'colL' — column-major from the left edge (each column top to bottom)
+//   dir 'colR' — column-major from the right edge
+//
+// key() returns an array compared element by element (numbers ascending,
+// strings via localeCompare).
+const SS_SORT_MODES = [
+  {
+    id: 'set',
+    label: () => L('ui_ss_mode_set', 'Set Items'),
+    hint:  () => L('ui_ss_mode_set_hint', 'Groups every piece of a set together, sets in alphabetical order.'),
+    noun:  () => L('ui_ss_noun_set', 'set items'),
+    atomicSets: true,
+    streams: [{ match: (it) => it.quality === 5, dir: 'row', key: () => [0] }],
+  },
+  {
+    id: 'uniqueGear',
+    label: () => L('ui_ss_mode_unique_gear', 'Unique Items'),
+    hint:  () => L('ui_ss_mode_gear_hint', 'By slot (helm, armor, shield, belt, gloves, boots, weapons), then required level.'),
+    noun:  () => L('ui_ss_noun_unique', 'unique items'),
+    streams: [{
+      match: (it) => it.quality === 7 && _ssIsGearItem(it),
+      dir: 'row',
+      key: (it) => [_ssGearGroupIndex(it), _ssItemSortLevel(it), _ssBaseName(it)],
+    }],
+  },
+  {
+    id: 'rareGear',
+    label: () => L('ui_ss_mode_rare_gear', 'Rare Items'),
+    hint:  () => L('ui_ss_mode_gear_hint', 'By slot (helm, armor, shield, belt, gloves, boots, weapons), then required level.'),
+    noun:  () => L('ui_ss_noun_rare', 'rare items'),
+    streams: [{
+      match: (it) => _ssIsRareLike(it) && _ssIsGearItem(it),
+      dir: 'row',
+      key: (it) => [_ssGearGroupIndex(it), _ssQualityRank(it), _ssItemSortLevel(it), _ssBaseName(it)],
+    }],
+  },
+  {
+    id: 'uniqueCharm',
+    label: () => L('ui_ss_mode_unique_charm', 'Unique Charms'),
+    hint:  () => L('ui_ss_mode_charm_hint', 'Grand charms first, then large, then small — each by required level.'),
+    noun:  () => L('ui_ss_noun_unique_charm', 'unique charms'),
+    streams: [{
+      match: (it) => it.quality === 7 && _ssTypeChainHas(it, ['char', 'torc']),
+      dir: 'row',
+      key: (it) => [-getItemSize(it.typeCode).h, _ssItemSortLevel(it), _ssBaseName(it)],
+    }],
+  },
+  {
+    id: 'magicCharm',
+    label: () => L('ui_ss_mode_magic_charm', 'Magic Charms'),
+    hint:  () => L('ui_ss_mode_charm_hint', 'Grand charms first, then large, then small — each by required level.'),
+    noun:  () => L('ui_ss_noun_magic_charm', 'magic charms'),
+    streams: [{
+      match: (it) => it.quality === 4 && _ssTypeChainHas(it, ['char', 'torc']),
+      dir: 'row',
+      key: (it) => [-getItemSize(it.typeCode).h, _ssItemSortLevel(it), _ssBaseName(it)],
+    }],
+  },
+  {
+    id: 'uniqueJewel',
+    label: () => L('ui_ss_mode_unique_jewel', 'Unique Jewels'),
+    hint:  () => L('ui_ss_mode_jewel_hint', 'By required level.'),
+    noun:  () => L('ui_ss_noun_unique_jewel', 'unique jewels'),
+    streams: [{
+      match: (it) => it.quality === 7 && _ssTypeChainHas(it, ['jewl']),
+      dir: 'row',
+      key: (it) => [_ssItemSortLevel(it), _ssBaseName(it)],
+    }],
+  },
+  {
+    id: 'rareMagicJewel',
+    label: () => L('ui_ss_mode_rare_magic_jewel', 'Rare & Magic Jewels'),
+    hint:  () => L('ui_ss_mode_jewel_split_hint', 'Rare jewels fill columns from the left, magic jewels from the right — both by required level.'),
+    noun:  () => L('ui_ss_noun_rare_magic_jewel', 'rare/magic jewels'),
+    streams: [
+      {
+        match: (it) => _ssIsRareLike(it) && _ssTypeChainHas(it, ['jewl']),
+        dir: 'colL',
+        key: (it) => [_ssQualityRank(it), _ssItemSortLevel(it), _ssBaseName(it)],
+      },
+      {
+        match: (it) => it.quality === 4 && _ssTypeChainHas(it, ['jewl']),
+        dir: 'colR',
+        key: (it) => [_ssItemSortLevel(it), _ssBaseName(it)],
+      },
+    ],
+  },
+  ..._ssRingAmuletModes(),
+];
+
+// Rings and amulets share one mode per quality tier: rings fill columns from
+// the left edge, amulets from the right, so the two never interleave.
+function _ssRingAmuletModes() {
+  const defs = [
+    { id: 'uniqueRingAmu', labelKey: 'ui_ss_mode_unique_ringamu', labelDef: 'Unique Rings & Amulets',
+      nounKey: 'ui_ss_noun_unique_ringamu', nounDef: 'unique rings & amulets',
+      match: (it) => it.quality === 7, ranked: false },
+    { id: 'rareRingAmu',   labelKey: 'ui_ss_mode_rare_ringamu',   labelDef: 'Rare Rings & Amulets',
+      nounKey: 'ui_ss_noun_rare_ringamu', nounDef: 'rare rings & amulets',
+      match: _ssIsRareLike, ranked: true },
+    { id: 'magicRingAmu',  labelKey: 'ui_ss_mode_magic_ringamu',  labelDef: 'Magic Rings & Amulets',
+      nounKey: 'ui_ss_noun_magic_ringamu', nounDef: 'magic rings & amulets',
+      match: (it) => it.quality === 4, ranked: false },
+  ];
+  return defs.map(d => ({
+    id: d.id,
+    label: () => L(d.labelKey, d.labelDef),
+    hint:  () => L('ui_ss_mode_ringamu_hint', 'Rings fill columns from the left, amulets from the right — both by required level.'),
+    noun:  () => L(d.nounKey, d.nounDef),
+    streams: [
+      {
+        match: (it) => d.match(it) && _ssTypeChainHas(it, ['ring']),
+        dir: 'colL',
+        key: (it) => (d.ranked ? [_ssQualityRank(it), _ssItemSortLevel(it), _ssBaseName(it)]
+                               : [_ssItemSortLevel(it), _ssBaseName(it)]),
+      },
+      {
+        match: (it) => d.match(it) && _ssTypeChainHas(it, ['amul']),
+        dir: 'colR',
+        key: (it) => (d.ranked ? [_ssQualityRank(it), _ssItemSortLevel(it), _ssBaseName(it)]
+                               : [_ssItemSortLevel(it), _ssBaseName(it)]),
+      },
+    ],
+  }));
+}
+
+function _ssSortMode(id) {
+  return SS_SORT_MODES.find(m => m.id === id) || SS_SORT_MODES[0];
+}
+
+// Does any of the mode's streams claim this item?
+function _ssModeMatches(mode, item) {
+  for (const s of mode.streams) if (s.match(item)) return true;
+  return false;
+}
+
+function _ssCompareKeys(a, b) {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i], y = b[i];
+    if (x === y) continue;
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (typeof x === 'string' || typeof y === 'string') {
+      const c = String(x).localeCompare(String(y), undefined, { sensitivity: 'base' });
+      if (c) return c;
+    } else if (x < y) return -1;
+    else if (x > y) return 1;
+  }
+  return 0;
 }
 
 function _ssRegularTabIndices() {
@@ -16439,37 +16717,86 @@ function _ssRegularTabLabel(physicalIdx) {
   return `${L('ui_ss_tab_prefix', 'Tab')} ${n}`;
 }
 
-function _ssTabStats(physicalIdx) {
+// Per-tab counts for the current sort mode: how many top-level items the tab
+// holds and how many of them the mode would move. setCount is only meaningful
+// for the 'set' mode, which is the only one that shows it.
+function _ssTabStats(physicalIdx, mode) {
   const tab = sharedStashParsed.tabs[physicalIdx];
   const groupMap = _ssSetGroupMap();
-  let total = 0, setItems = 0;
+  let total = 0, match = 0;
   const groupsSeen = new Set();
   for (const it of tab.items) {
     if (it.parent !== 0 || it.storage !== 5) continue; // top-level stash items only
     total++;
     ensureItemProps(it);
-    if (it.quality === 5) {
-      setItems++;
+    if (!_ssModeMatches(mode, it)) continue;
+    match++;
+    if (mode.atomicSets) {
       const sid = it.setId !== undefined ? it.setId : it.setItemId;
       groupsSeen.add(groupMap[sid] || `Set #${sid}`);
     }
   }
-  return { total, setItems, setCount: groupsSeen.size };
+  return { total, match, setCount: groupsSeen.size };
 }
 
 function _ssTabMatchesFilter(stats, filter) {
   switch (filter) {
-    case 'onlySet': return stats.total > 0 && stats.setItems === stats.total;
-    case 'hasSet':  return stats.setItems > 0;
-    case 'empty':   return stats.total === 0;
-    default:        return true; // 'all'
+    case 'onlyMatch': return stats.total > 0 && stats.match === stats.total;
+    case 'hasMatch':  return stats.match > 0;
+    case 'empty':     return stats.total === 0;
+    default:          return true; // 'all'
   }
+}
+
+// Candidate top-left origins, in the order a stream should try them.
+//   'row'  — row-major, left to right, top to bottom
+//   'colL' — column-major from the left edge (each column top to bottom)
+//   'colR' — column-major from the right edge
+// Cached per direction; the shared-stash grid is a fixed 16x13 everywhere.
+const _ssScanOrderCache = {};
+function _ssScanOrder(dir, gridW, gridH) {
+  const key = `${dir}:${gridW}x${gridH}`;
+  if (_ssScanOrderCache[key]) return _ssScanOrderCache[key];
+  const out = [];
+  if (dir === 'colL' || dir === 'colR') {
+    for (let i = 0; i < gridW; i++) {
+      const x = dir === 'colL' ? i : gridW - 1 - i;
+      for (let y = 0; y < gridH; y++) out.push({ x, y });
+    }
+  } else {
+    for (let y = 0; y < gridH; y++) for (let x = 0; x < gridW; x++) out.push({ x, y });
+  }
+  _ssScanOrderCache[key] = out;
+  return out;
+}
+
+// Places one item without ever looking behind the cursor, so the on-screen
+// reading order always matches the sort order — a small item can never drop
+// back into a hole an earlier, larger item left above it. Costs a few empty
+// cells; that trade-off is deliberate.
+function _ssPlaceMonotonic(occ, order, cursor, gridW, gridH, w, h) {
+  for (let i = cursor.i; i < order.length; i++) {
+    const { x, y } = order[i];
+    if (x + w > gridW || y + h > gridH) continue;
+    let fits = true;
+    for (let dy = 0; dy < h && fits; dy++)
+      for (let dx = 0; dx < w && fits; dx++)
+        if (occ.has(`${x + dx},${y + dy}`)) fits = false;
+    if (!fits) continue;
+    for (let dy = 0; dy < h; dy++)
+      for (let dx = 0; dx < w; dx++)
+        occ.add(`${x + dx},${y + dy}`);
+    cursor.i = i;
+    return { x, y };
+  }
+  return null;
 }
 
 // Pure simulation — touches no bytes, only reads sharedStashParsed as it
 // currently stands. Safe to call repeatedly (e.g. once per target tab the
 // user picks) without side effects until the caller applies the result.
-function _ssPlanSort(sourceIdxs, targetOrder) {
+function _ssPlanSort(sourceIdxs, targetOrder, mode) {
+  mode = mode || _ssSortMode('set');
   const gridW = 16, gridH = 13; // same fixed size renderSharedStashTabs uses for every regular tab
   const groupMap = _ssSetGroupMap();
 
@@ -16479,29 +16806,27 @@ function _ssPlanSort(sourceIdxs, targetOrder) {
     for (const it of tab.items) {
       if (it.parent !== 0 || it.storage !== 5) continue;
       ensureItemProps(it);
-      if (it.quality !== 5) continue;
-      const setId = it.setId !== undefined ? it.setId : it.setItemId;
-      if (setId === undefined) continue;
+      const streamIdx = mode.streams.findIndex(s => s.match(it));
+      if (streamIdx < 0) continue;
       const { w, h } = getItemSize(it.typeCode);
       const children = findSocketedChildren(sharedStashData, tab.items, it);
-      const setGroup = groupMap[setId] || `Set #${setId}`;
-      moveItems.push({ item: it, tabIdx: tIdx, w, h, children, setId, setGroup });
+      const mi = { item: it, tabIdx: tIdx, w, h, children, streamIdx,
+                   sortKey: mode.streams[streamIdx].key(it) };
+      if (mode.atomicSets) {
+        const setId = it.setId !== undefined ? it.setId : it.setItemId;
+        if (setId === undefined) continue;
+        mi.setId = setId;
+        mi.setGroup = groupMap[setId] || `Set #${setId}`;
+      }
+      moveItems.push(mi);
     }
   }
   if (!moveItems.length) return { ok: false, empty: true };
 
   const moveItemOffsets = new Set(moveItems.map(mi => mi.item.byteOffset));
 
-  const groups = new Map(); // setGroup name -> mi[]
-  for (const mi of moveItems) {
-    if (!groups.has(mi.setGroup)) groups.set(mi.setGroup, []);
-    groups.get(mi.setGroup).push(mi);
-  }
-  const orderedGroups = [...groups.entries()]
-    .sort((a, b) => a[0].localeCompare(b[0], undefined, { sensitivity: 'base' }));
-
   // Occupancy = cells taken by items that are staying put (either not part of
-  // this move, or not set items at all). Items being moved free their old
+  // this move, or not items this mode claims). Items being moved free their old
   // cells since they'll be repositioned by this same operation.
   function buildOccupancy(tabIdx) {
     const occ = new Set();
@@ -16516,6 +16841,42 @@ function _ssPlanSort(sourceIdxs, targetOrder) {
   }
   const occByTab = new Map(targetOrder.map(idx => [idx, buildOccupancy(idx)]));
   const placements = [];
+
+  if (!mode.atomicSets) {
+    // Flat-stream modes. Each stream is laid down in full before the next one
+    // starts, so a two-stream mode (rings from the left, amulets from the
+    // right) never interleaves the two halves. Once a stream runs out of room
+    // in a tab it advances permanently to the next target tab rather than
+    // backfilling — same order-over-density rule as _ssPlaceMonotonic.
+    for (let si = 0; si < mode.streams.length; si++) {
+      const stream = mode.streams[si];
+      const items = moveItems.filter(mi => mi.streamIdx === si)
+                             .sort((a, b) => _ssCompareKeys(a.sortKey, b.sortKey));
+      if (!items.length) continue;
+      const order = _ssScanOrder(stream.dir, gridW, gridH);
+      const cursors = new Map(targetOrder.map(idx => [idx, { i: 0 }]));
+      let tabPos = 0;
+      for (const mi of items) {
+        let placed = null;
+        while (tabPos < targetOrder.length) {
+          const tIdx = targetOrder[tabPos];
+          placed = _ssPlaceMonotonic(occByTab.get(tIdx), order, cursors.get(tIdx), gridW, gridH, mi.w, mi.h);
+          if (placed) { placements.push({ mi, destTabIdx: tIdx, x: placed.x, y: placed.y }); break; }
+          tabPos++;
+        }
+        if (!placed) return { ok: false, needsTab: true };
+      }
+    }
+    return { ok: true, placements, targetOrder: targetOrder.slice(), mode };
+  }
+
+  const groups = new Map(); // setGroup name -> mi[]
+  for (const mi of moveItems) {
+    if (!groups.has(mi.setGroup)) groups.set(mi.setGroup, []);
+    groups.get(mi.setGroup).push(mi);
+  }
+  const orderedGroups = [...groups.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0], undefined, { sensitivity: 'base' }));
 
   for (const [setGroup, items] of orderedGroups) {
     // Phase 1: try to place the whole set atomically into one target tab.
@@ -16574,7 +16935,7 @@ function _ssPlanSort(sourceIdxs, targetOrder) {
     }
   }
 
-  return { ok: true, placements, targetOrder: targetOrder.slice() };
+  return { ok: true, placements, targetOrder: targetOrder.slice(), mode };
 }
 
 function _ssConcatU8(chunks) {
@@ -16790,19 +17151,27 @@ function _ssApplySortPlan(plan) {
   }
 
   const itemTotal = plan.placements.reduce((s, p) => s + 1 + p.mi.children.length, 0);
-  const setTotal = new Set(plan.placements.map(p => p.mi.setGroup)).size;
 
   markSharedStashDirty();
   renderSharedStashTabs();
-  showPopup(Lfmt('ui_ss_sort_done', 'Sorted {sets} set(s) ({items} item(s)) across {tabs} tab(s).',
-    { sets: setTotal, items: itemTotal, tabs: plan.targetOrder.length }));
+  if (plan.mode && plan.mode.atomicSets) {
+    const setTotal = new Set(plan.placements.map(p => p.mi.setGroup)).size;
+    showPopup(Lfmt('ui_ss_sort_done', 'Sorted {sets} set(s) ({items} item(s)) across {tabs} tab(s).',
+      { sets: setTotal, items: itemTotal, tabs: plan.targetOrder.length }));
+  } else {
+    showPopup(Lfmt('ui_ss_sort_done_generic', 'Sorted {items} item(s) across {tabs} tab(s).',
+      { items: itemTotal, tabs: plan.targetOrder.length }));
+  }
 }
 
-// ── Sort Set Items modal ──
-window.openSortSetItemsModal = function() {
+// ── Sort Items modal ──
+// Step 0 picks the sort mode, then the original two steps (source tabs →
+// target tabs) run unchanged against whichever mode was chosen.
+window.openSortItemsModal = function() {
   if (!sharedStashParsed) return;
   _ssSortState = {
-    step: 1,
+    step: 0,
+    modeId: SS_SORT_MODES[0].id,
     sourceSel: new Set(),
     sourceFilter: 'all',
     targetFilter: 'all',
@@ -16811,6 +17180,30 @@ window.openSortSetItemsModal = function() {
   };
   const modal = document.getElementById('ssSortModal');
   if (modal) modal.classList.add('visible');
+  _renderSsSortModal();
+};
+
+function _ssCurrentMode() {
+  return _ssSortMode(_ssSortState ? _ssSortState.modeId : 'set');
+}
+
+window.ssSortPickMode = function(modeId) {
+  if (!_ssSortState) return;
+  _ssSortState.modeId = modeId;
+  _ssSortState.step = 1;
+  _ssSortState.sourceSel = new Set();
+  _ssSortState.sourceFilter = 'all';
+  _ssSortState.targetFilter = 'all';
+  _ssSortState.targetOrder = [];
+  _ssSortState.pendingReason = null;
+  _renderSsSortModal();
+};
+
+window.ssSortBackToModeStep = function() {
+  if (!_ssSortState) return;
+  _ssSortState.step = 0;
+  _ssSortState.targetOrder = [];
+  _ssSortState.pendingReason = null;
   _renderSsSortModal();
 };
 
@@ -16841,7 +17234,8 @@ window.ssSortToggleSource = function(idx) {
 
 window.ssSortSelectAllSources = function() {
   if (!_ssSortState) return;
-  const indices = _ssRegularTabIndices().filter(i => _ssTabMatchesFilter(_ssTabStats(i), _ssSortState.sourceFilter));
+  const mode = _ssCurrentMode();
+  const indices = _ssRegularTabIndices().filter(i => _ssTabMatchesFilter(_ssTabStats(i, mode), _ssSortState.sourceFilter));
   for (const i of indices) _ssSortState.sourceSel.add(i);
   _renderSsSortModal();
 };
@@ -16862,34 +17256,40 @@ window.ssSortBackToSourceStep = function() {
 
 window.ssSortGoToTargetStep = function() {
   if (!_ssSortState) return;
+  const mode = _ssCurrentMode();
   if (!_ssSortState.sourceSel.size) { showPopup(L('ui_ss_sort_pick_source', 'Pick at least one source tab.')); return; }
-  let anySet = false;
+  let anyMatch = false;
   for (const idx of _ssSortState.sourceSel) {
-    if (_ssTabStats(idx).setItems > 0) { anySet = true; break; }
+    if (_ssTabStats(idx, mode).match > 0) { anyMatch = true; break; }
   }
-  if (!anySet) { showPopup(L('ui_ss_sort_no_set_items', 'No set items found in the selected tabs.')); return; }
+  if (!anyMatch) { showPopup(_ssNoMatchMsg(mode)); return; }
   _ssSortState.step = 2;
   _renderSsSortModal();
 };
+
+function _ssNoMatchMsg(mode) {
+  return Lfmt('ui_ss_sort_no_match', 'No {noun} found in the selected tabs.', { noun: mode.noun() });
+}
 
 window.ssSortPickTarget = function(idx) {
   if (!_ssSortState) return;
   if (_ssSortState.targetOrder.includes(idx)) return;
   _ssSortState.targetOrder.push(idx);
 
+  const mode = _ssCurrentMode();
   const sourceIdxs = [..._ssSortState.sourceSel];
-  const plan = _ssPlanSort(sourceIdxs, _ssSortState.targetOrder);
+  const plan = _ssPlanSort(sourceIdxs, _ssSortState.targetOrder, mode);
 
   if (plan.ok) {
     _ssShowSortConfirm(plan);
     return;
   }
   if (plan.needsTab) {
-    _ssSortState.pendingReason = { setGroup: plan.setGroup };
+    _ssSortState.pendingReason = { setGroup: plan.setGroup || '' };
     _renderSsSortModal();
     return;
   }
-  showPopup(L('ui_ss_sort_no_set_items', 'No set items found in the selected tabs.'));
+  showPopup(_ssNoMatchMsg(mode));
   closeSsSortModal();
 };
 
@@ -16911,81 +17311,109 @@ window.ssSortClearTargets = function() {
 };
 
 function _ssShowSortConfirm(plan) {
-  const setTotal = new Set(plan.placements.map(p => p.mi.setGroup)).size;
   const itemTotal = plan.placements.reduce((s, p) => s + 1 + p.mi.children.length, 0);
   const tabLabels = plan.targetOrder.map(i => _ssRegularTabLabel(i)).join(', ');
+  const msg = (plan.mode && plan.mode.atomicSets)
+    ? Lfmt('ui_ss_sort_confirm_msg', 'Move {sets} set(s) ({items} item(s)) into: {tabs}?',
+        { sets: new Set(plan.placements.map(p => p.mi.setGroup)).size, items: itemTotal, tabs: tabLabels })
+    : Lfmt('ui_ss_sort_confirm_msg_generic', 'Move {items} item(s) into: {tabs}?',
+        { items: itemTotal, tabs: tabLabels });
   closeSsSortModal();
-  showConfirm(
-    Lfmt('ui_ss_sort_confirm_msg', 'Move {sets} set(s) ({items} item(s)) into: {tabs}?',
-      { sets: setTotal, items: itemTotal, tabs: tabLabels }),
-    () => { _ssApplySortPlan(plan); },
-    L('ui_ss_sort_confirm_btn', 'Sort')
-  );
+  showConfirm(msg, () => { _ssApplySortPlan(plan); }, L('ui_ss_sort_confirm_btn', 'Sort'));
 }
 
 function _renderSsSortModal() {
   const body = document.getElementById('ssSortModalBody');
   const st = _ssSortState;
   if (!body || !st) return;
+  const mode = _ssCurrentMode();
   let html = '';
 
   const filterBtn = (key, label, active, onClickFn) =>
     `<button type="button" class="modal-sort-btn${active === key ? ' active' : ''}" onclick="${onClickFn}('${key}')">${esc(label)}</button>`;
 
-  if (st.step === 1) {
-    html += `<div class="modal-title">${esc(L('ui_ss_sort_step1_title', 'Sort Set Items — Choose Source Tabs'))}</div>`;
-    html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(L('ui_ss_sort_step1_hint', 'Select which tabs to scan for set items.'))}</div>`;
+  // The set mode keeps its richer "N sets" readout; every other mode just
+  // reports how many items it would move.
+  const statsText = (stats) => mode.atomicSets
+    ? Lfmt('ui_ss_sort_tab_stats', '{total} item(s) · {setItems} set item(s) · {setCount} set(s)',
+        { total: stats.total, setItems: stats.match, setCount: stats.setCount })
+    : Lfmt('ui_ss_sort_tab_stats_generic', '{total} item(s) · {match} {noun}',
+        { total: stats.total, match: stats.match, noun: mode.noun() });
 
-    html += `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">`
-          + filterBtn('all', L('ui_ss_filter_all', 'All tabs'), st.sourceFilter, 'ssSortSetSourceFilter')
-          + filterBtn('onlySet', L('ui_ss_filter_only_set', 'Only tabs with only set items'), st.sourceFilter, 'ssSortSetSourceFilter')
-          + filterBtn('hasSet', L('ui_ss_filter_has_set', 'Only tabs with ≥1 set item'), st.sourceFilter, 'ssSortSetSourceFilter')
+  const filterRow = (active, onClickFn, withEmpty) => {
+    let out = `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">`
+      + filterBtn('all', L('ui_ss_filter_all', 'All tabs'), active, onClickFn)
+      + filterBtn('onlyMatch', Lfmt('ui_ss_filter_only_match', 'Only tabs holding nothing but {noun}', { noun: mode.noun() }), active, onClickFn)
+      + filterBtn('hasMatch', Lfmt('ui_ss_filter_has_match', 'Only tabs containing {noun}', { noun: mode.noun() }), active, onClickFn);
+    if (withEmpty) out += filterBtn('empty', L('ui_ss_filter_empty', 'Only empty tabs'), active, onClickFn);
+    return out + `</div>`;
+  };
+
+  if (st.step === 0) {
+    html += `<div class="modal-title">${esc(L('ui_ss_sort_step0_title', 'Sort Items — Choose What to Sort'))}</div>`;
+    html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(L('ui_ss_sort_step0_hint', 'Each mode moves only the items it claims — everything else stays where it is.'))}</div>`;
+
+    html += `<div style="max-height:400px;overflow-y:auto;border:1px solid var(--d2-border);border-radius:2px;margin-bottom:14px">`;
+    for (const m of SS_SORT_MODES) {
+      html += `<div onclick="ssSortPickMode('${m.id}')" style="padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--d2-border)">`
+            + `<div style="font-family:'Cinzel',serif;font-size:13px;color:var(--d2-gold)">${esc(m.label())}</div>`
+            + `<div style="font-size:11px;color:var(--d2-text-dim);margin-top:3px">${esc(m.hint())}</div>`
+            + `</div>`;
+    }
+    html += `</div>`;
+
+    html += `<div class="modal-footer">`
+          + `<button type="button" class="btn btn-primary" style="opacity:0.7" onclick="closeSsSortModal()">${esc(L('ui_cancel', 'Cancel'))}</button>`
           + `</div>`;
+  } else if (st.step === 1) {
+    html += `<div class="modal-title">${esc(Lfmt('ui_ss_sort_step1_title2', 'Sort {mode} — Choose Source Tabs', { mode: mode.label() }))}</div>`;
+    html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(Lfmt('ui_ss_sort_step1_hint2', 'Select which tabs to scan for {noun}.', { noun: mode.noun() }))}</div>`;
+
+    html += filterRow(st.sourceFilter, 'ssSortSetSourceFilter', false);
 
     html += `<div style="display:flex;gap:8px;margin-bottom:10px">`
           + `<button type="button" class="btn" style="margin:0" onclick="ssSortSelectAllSources()">${esc(L('ui_ss_select_all', 'Select All'))}</button>`
           + `<button type="button" class="btn" style="margin:0" onclick="ssSortSelectNoneSources()">${esc(L('ui_ss_select_none', 'Select None'))}</button>`
           + `</div>`;
 
-    const indices = _ssRegularTabIndices().filter(i => _ssTabMatchesFilter(_ssTabStats(i), st.sourceFilter));
+    const indices = _ssRegularTabIndices().filter(i => _ssTabMatchesFilter(_ssTabStats(i, mode), st.sourceFilter));
     html += `<div style="max-height:340px;overflow-y:auto;border:1px solid var(--d2-border);border-radius:2px;margin-bottom:14px">`;
     if (!indices.length) {
       html += `<div style="padding:14px;font-size:12px;color:var(--d2-text-dim);font-style:italic">${esc(L('ui_ss_sort_no_tabs', 'No tabs match this filter.'))}</div>`;
     }
     for (const idx of indices) {
-      const stats = _ssTabStats(idx);
+      const stats = _ssTabStats(idx, mode);
       const checked = st.sourceSel.has(idx);
       html += `<div onclick="ssSortToggleSource(${idx})" style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--d2-border);background:${checked ? 'rgba(200,168,75,0.10)' : 'transparent'}">`
             + `<div style="display:flex;align-items:center;gap:10px">`
             + `<input type="checkbox" ${checked ? 'checked' : ''} style="accent-color:var(--d2-gold);pointer-events:none">`
             + `<span style="font-family:'Cinzel',serif;font-size:13px;color:var(--d2-gold)">${esc(_ssRegularTabLabel(idx))}</span>`
             + `</div>`
-            + `<div style="font-size:11px;color:var(--d2-text-dim)">${esc(Lfmt('ui_ss_sort_tab_stats', '{total} item(s) · {setItems} set item(s) · {setCount} set(s)', stats))}</div>`
+            + `<div style="font-size:11px;color:var(--d2-text-dim)">${esc(statsText(stats))}</div>`
             + `</div>`;
     }
     html += `</div>`;
 
     html += `<div class="modal-footer">`
+          + `<button type="button" class="btn" style="margin:0" onclick="ssSortBackToModeStep()">${esc(L('ui_back', 'Back'))}</button>`
           + `<button type="button" class="btn btn-primary" onclick="ssSortGoToTargetStep()">${esc(L('ui_ss_sort_next', 'Next: Choose Target Tab'))}</button>`
           + `<button type="button" class="btn btn-primary" style="opacity:0.7" onclick="closeSsSortModal()">${esc(L('ui_cancel', 'Cancel'))}</button>`
           + `</div>`;
   } else {
-    html += `<div class="modal-title">${esc(L('ui_ss_sort_step2_title', 'Sort Set Items — Choose Target Tab'))}</div>`;
+    html += `<div class="modal-title">${esc(Lfmt('ui_ss_sort_step2_title2', 'Sort {mode} — Choose Target Tab', { mode: mode.label() }))}</div>`;
 
     if (st.pendingReason) {
+      const msg = (mode.atomicSets && st.pendingReason.setGroup)
+        ? Lfmt('ui_ss_sort_need_more_tab', 'Not enough room for set "{set}" — pick another tab to continue.', { set: st.pendingReason.setGroup })
+        : L('ui_ss_sort_need_more_tab_generic', 'Not enough room — pick another tab to continue.');
       html += `<div style="margin-bottom:12px;padding:10px 12px;border-left:3px solid var(--d2-gold);background:rgba(200,160,48,0.08);font-size:12px;color:var(--d2-text)">`
-            + esc(Lfmt('ui_ss_sort_need_more_tab', 'Not enough room for set "{set}" — pick another tab to continue.', { set: st.pendingReason.setGroup }))
+            + esc(msg)
             + `</div>`;
     } else {
-      html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(L('ui_ss_sort_step2_hint', 'Choose which tab set items should be moved into.'))}</div>`;
+      html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(Lfmt('ui_ss_sort_step2_hint2', 'Choose which tab the {noun} should be moved into.', { noun: mode.noun() }))}</div>`;
     }
 
-    html += `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">`
-          + filterBtn('all', L('ui_ss_filter_all', 'All tabs'), st.targetFilter, 'ssSortSetTargetFilter')
-          + filterBtn('onlySet', L('ui_ss_filter_only_set', 'Only tabs with only set items'), st.targetFilter, 'ssSortSetTargetFilter')
-          + filterBtn('hasSet', L('ui_ss_filter_has_set', 'Only tabs with ≥1 set item'), st.targetFilter, 'ssSortSetTargetFilter')
-          + filterBtn('empty', L('ui_ss_filter_empty', 'Only empty tabs'), st.targetFilter, 'ssSortSetTargetFilter')
-          + `</div>`;
+    html += filterRow(st.targetFilter, 'ssSortSetTargetFilter', true);
 
     if (st.targetOrder.length) {
       html += `<div style="margin-bottom:10px">`
@@ -17006,17 +17434,17 @@ function _renderSsSortModal() {
     const used = new Set(st.targetOrder);
     const indices = _ssRegularTabIndices()
       .filter(i => !used.has(i))
-      .filter(i => _ssTabMatchesFilter(_ssTabStats(i), st.targetFilter));
+      .filter(i => _ssTabMatchesFilter(_ssTabStats(i, mode), st.targetFilter));
 
     html += `<div style="max-height:320px;overflow-y:auto;border:1px solid var(--d2-border);border-radius:2px;margin-bottom:14px">`;
     if (!indices.length) {
       html += `<div style="padding:14px;font-size:12px;color:var(--d2-text-dim);font-style:italic">${esc(L('ui_ss_sort_no_tabs', 'No tabs match this filter.'))}</div>`;
     }
     for (const idx of indices) {
-      const stats = _ssTabStats(idx);
+      const stats = _ssTabStats(idx, mode);
       html += `<div onclick="ssSortPickTarget(${idx})" style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--d2-border)">`
             + `<span style="font-family:'Cinzel',serif;font-size:13px;color:var(--d2-gold)">${esc(_ssRegularTabLabel(idx))}</span>`
-            + `<span style="font-size:11px;color:var(--d2-text-dim)">${esc(Lfmt('ui_ss_sort_tab_stats', '{total} item(s) · {setItems} set item(s) · {setCount} set(s)', stats))}</span>`
+            + `<span style="font-size:11px;color:var(--d2-text-dim)">${esc(statsText(stats))}</span>`
             + `</div>`;
     }
     html += `</div>`;
@@ -17113,7 +17541,7 @@ function renderSharedStashTabs() {
   html += `<button type="button" class="btn ${_ssSwapMode ? 'btn-primary' : ''}" style="margin:0" onclick="toggleSharedStashSwapMode()">`
         + (_ssSwapMode ? esc(L('ui_ss_swap_mode_on', 'Swapping Tabs')) : esc(L('ui_ss_swap_mode_off', 'Swap Tab Contents')))
         + `</button>`;
-  html += `<button type="button" class="btn" style="margin:0" onclick="openSortSetItemsModal()">${esc(L('ui_ss_sort_btn', 'Sort Set Items'))}</button>`;
+  html += `<button type="button" class="btn" style="margin:0" onclick="openSortItemsModal()">${esc(L('ui_ss_sort_btn2', 'Sort Items'))}</button>`;
   html += `</div>`;
   if (_ssSwapMode) {
     html += `<div style="color:var(--d2-text-dim);font-size:11.5px;margin-bottom:10px;font-style:italic">`
