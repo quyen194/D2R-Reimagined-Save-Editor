@@ -16605,6 +16605,11 @@ function _ssItemSortLevel(item) {
 // Crafted (q=8) sorts ahead of rare (q=6) inside each group.
 function _ssQualityRank(item) { return item.quality === 8 ? 0 : 1; }
 
+// Item level, negated so a plain ascending comparison puts the HIGHEST ilvl
+// first. Used as the tie-break whenever two items need the same level to
+// equip: same requirement, better roll potential goes on top.
+function _ssIlvlDesc(item) { return -(item.itemLevel || 0); }
+
 function _ssBaseName(item) { return itemNameFromCode(item.typeCode || ''); }
 
 const _ssIsRareLike = (it) => it.quality === 6 || it.quality === 8;
@@ -16638,7 +16643,7 @@ const SS_SORT_MODES = [
     streams: [{
       match: (it) => it.quality === 7 && _ssIsGearItem(it),
       dir: 'row',
-      key: (it) => [_ssGearGroupIndex(it), _ssItemSortLevel(it), _ssBaseName(it)],
+      key: (it) => [_ssGearGroupIndex(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
     }],
   },
   {
@@ -16649,7 +16654,7 @@ const SS_SORT_MODES = [
     streams: [{
       match: (it) => _ssIsRareLike(it) && _ssIsGearItem(it),
       dir: 'row',
-      key: (it) => [_ssGearGroupIndex(it), _ssQualityRank(it), _ssItemSortLevel(it), _ssBaseName(it)],
+      key: (it) => [_ssGearGroupIndex(it), _ssQualityRank(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
     }],
   },
   {
@@ -16660,7 +16665,7 @@ const SS_SORT_MODES = [
     streams: [{
       match: (it) => it.quality === 7 && _ssTypeChainHas(it, ['char', 'torc']),
       dir: 'row',
-      key: (it) => [-getItemSize(it.typeCode).h, _ssItemSortLevel(it), _ssBaseName(it)],
+      key: (it) => [-getItemSize(it.typeCode).h, _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
     }],
   },
   {
@@ -16671,7 +16676,7 @@ const SS_SORT_MODES = [
     streams: [{
       match: (it) => it.quality === 4 && _ssTypeChainHas(it, ['char', 'torc']),
       dir: 'row',
-      key: (it) => [-getItemSize(it.typeCode).h, _ssItemSortLevel(it), _ssBaseName(it)],
+      key: (it) => [-getItemSize(it.typeCode).h, _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
     }],
   },
   {
@@ -16682,7 +16687,7 @@ const SS_SORT_MODES = [
     streams: [{
       match: (it) => it.quality === 7 && _ssTypeChainHas(it, ['jewl']),
       dir: 'row',
-      key: (it) => [_ssItemSortLevel(it), _ssBaseName(it)],
+      key: (it) => [_ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
     }],
   },
   {
@@ -16694,12 +16699,12 @@ const SS_SORT_MODES = [
       {
         match: (it) => _ssIsRareLike(it) && _ssTypeChainHas(it, ['jewl']),
         dir: 'colL',
-        key: (it) => [_ssQualityRank(it), _ssItemSortLevel(it), _ssBaseName(it)],
+        key: (it) => [_ssQualityRank(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
       },
       {
         match: (it) => it.quality === 4 && _ssTypeChainHas(it, ['jewl']),
         dir: 'colR',
-        key: (it) => [_ssItemSortLevel(it), _ssBaseName(it)],
+        key: (it) => [_ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
       },
     ],
   },
@@ -16729,14 +16734,14 @@ function _ssRingAmuletModes() {
       {
         match: (it) => d.match(it) && _ssTypeChainHas(it, ['ring']),
         dir: 'colL',
-        key: (it) => (d.ranked ? [_ssQualityRank(it), _ssItemSortLevel(it), _ssBaseName(it)]
-                               : [_ssItemSortLevel(it), _ssBaseName(it)]),
+        key: (it) => (d.ranked ? [_ssQualityRank(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)]
+                               : [_ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)]),
       },
       {
         match: (it) => d.match(it) && _ssTypeChainHas(it, ['amul']),
         dir: 'colR',
-        key: (it) => (d.ranked ? [_ssQualityRank(it), _ssItemSortLevel(it), _ssBaseName(it)]
-                               : [_ssItemSortLevel(it), _ssBaseName(it)]),
+        key: (it) => (d.ranked ? [_ssQualityRank(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)]
+                               : [_ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)]),
       },
     ],
   }));
@@ -16894,15 +16899,34 @@ function _ssPlanSort(sourceIdxs, targetOrder, mode) {
 
   const moveItemOffsets = new Set(moveItems.map(mi => mi.item.byteOffset));
 
-  // Occupancy = cells taken by items that are staying put (either not part of
-  // this move, or not items this mode claims). Items being moved free their old
-  // cells since they'll be repositioned by this same operation.
+  // Items already sitting in a target tab that this mode does not claim. A
+  // target tab is meant to end up holding this one category, so rather than
+  // sorting around them they get swept below the sorted block — no order of
+  // their own, they just have to be out of the way. Items in source tabs that
+  // aren't targets are left exactly where they are.
+  const strayItems = [];
+  for (const tIdx of targetOrder) {
+    const tab = sharedStashParsed.tabs[tIdx];
+    for (const it of tab.items) {
+      if (it.parent !== 0 || it.storage !== 5) continue;
+      if (moveItemOffsets.has(it.byteOffset)) continue;
+      ensureItemProps(it);
+      const { w, h } = getItemSize(it.typeCode);
+      strayItems.push({ item: it, tabIdx: tIdx, w, h,
+                        children: findSocketedChildren(sharedStashData, tab.items, it) });
+    }
+  }
+  const strayOffsets = new Set(strayItems.map(mi => mi.item.byteOffset));
+
+  // Occupancy = cells taken by items that are staying put. Anything being
+  // repositioned by this operation — sorted items and swept strays alike —
+  // frees its old cells.
   function buildOccupancy(tabIdx) {
     const occ = new Set();
     const tab = sharedStashParsed.tabs[tabIdx];
     for (const it of tab.items) {
       if (it.parent !== 0 || it.storage !== 5) continue;
-      if (moveItemOffsets.has(it.byteOffset)) continue;
+      if (moveItemOffsets.has(it.byteOffset) || strayOffsets.has(it.byteOffset)) continue;
       const { w, h } = getItemSize(it.typeCode);
       for (let dy = 0; dy < h; dy++) for (let dx = 0; dx < w; dx++) occ.add(`${it.x + dx},${it.y + dy}`);
     }
@@ -16910,6 +16934,33 @@ function _ssPlanSort(sourceIdxs, targetOrder, mode) {
   }
   const occByTab = new Map(targetOrder.map(idx => [idx, buildOccupancy(idx)]));
   const placements = [];
+
+  // Lowest free row per target tab once the sorted items are down — where the
+  // swept strays start, so they can never wedge themselves into the sorted run.
+  const sortedBottom = new Map(targetOrder.map(idx => [idx, 0]));
+  const noteBottom = (tIdx, y, h) => {
+    if ((y + h) > sortedBottom.get(tIdx)) sortedBottom.set(tIdx, y + h);
+  };
+
+  // Places the swept strays after everything else. Order among them is
+  // irrelevant, so this is plain first-fit from the first free row downwards.
+  function placeStrays() {
+    if (!strayItems.length) return true;
+    const order = _ssScanOrder('row', gridW, gridH);
+    const cursors = new Map(targetOrder.map(idx => [idx, { i: sortedBottom.get(idx) * gridW }]));
+    let tabPos = 0;
+    for (const mi of strayItems) {
+      let placed = null;
+      while (tabPos < targetOrder.length) {
+        const tIdx = targetOrder[tabPos];
+        placed = _ssPlaceMonotonic(occByTab.get(tIdx), order, cursors.get(tIdx), gridW, gridH, mi.w, mi.h);
+        if (placed) { placements.push({ mi, destTabIdx: tIdx, x: placed.x, y: placed.y }); break; }
+        tabPos++;
+      }
+      if (!placed) return false;
+    }
+    return true;
+  }
 
   if (!mode.atomicSets) {
     // Flat-stream modes. Each stream is laid down in full before the next one
@@ -16930,12 +16981,17 @@ function _ssPlanSort(sourceIdxs, targetOrder, mode) {
         while (tabPos < targetOrder.length) {
           const tIdx = targetOrder[tabPos];
           placed = _ssPlaceMonotonic(occByTab.get(tIdx), order, cursors.get(tIdx), gridW, gridH, mi.w, mi.h);
-          if (placed) { placements.push({ mi, destTabIdx: tIdx, x: placed.x, y: placed.y }); break; }
+          if (placed) {
+            placements.push({ mi, destTabIdx: tIdx, x: placed.x, y: placed.y });
+            noteBottom(tIdx, placed.y, mi.h);
+            break;
+          }
           tabPos++;
         }
         if (!placed) return { ok: false, needsTab: true };
       }
     }
+    if (!placeStrays()) return { ok: false, needsTab: true };
     return { ok: true, placements, targetOrder: targetOrder.slice(), mode };
   }
 
@@ -16962,6 +17018,7 @@ function _ssPlanSort(sourceIdxs, targetOrder, mode) {
       if (ok) {
         occByTab.set(tIdx, trial);
         placements.push(...tryPlacements);
+        for (const p of tryPlacements) noteBottom(p.destTabIdx, p.y, p.mi.h);
         fitted = true;
         break;
       }
@@ -16995,6 +17052,7 @@ function _ssPlanSort(sourceIdxs, targetOrder, mode) {
       if (stillOk) {
         occByTab.set(tA, occA); occByTab.set(tB, occB);
         placements.push(...tryPlacements);
+        for (const p of tryPlacements) noteBottom(p.destTabIdx, p.y, p.mi.h);
         splitOk = true;
         break;
       }
@@ -17004,6 +17062,7 @@ function _ssPlanSort(sourceIdxs, targetOrder, mode) {
     }
   }
 
+  if (!placeStrays()) return { ok: false, needsTab: true };
   return { ok: true, placements, targetOrder: targetOrder.slice(), mode };
 }
 
@@ -17225,38 +17284,47 @@ function _ssApplySortPlan(plan) {
 
 }
 
-// ── In-place sort: sorted items go back into the source tabs ─────────────
+// ── In-place sort ────────────────────────────────────────────────────────
 //
-// The source tabs are the destination. When they can't hold everything, spare
-// empty tabs are borrowed from the far end of the stash — last empty tab
-// first — and each one is pulled forward to sit immediately behind the last
-// source tab, pushing every tab after it one slot along. Running out of spare
-// empty tabs is a hard failure that rolls the whole operation back.
+// Items are gathered from the source tabs and laid back down into the target
+// tabs, which are a subset of the sources the user picks separately — a tab
+// can hold items worth collecting while being reserved for a different
+// category, so "everything I scanned" and "where it all goes" are two
+// different questions.
+//
+// When the targets can't hold everything, spare empty tabs are borrowed from
+// the far end of the stash — last empty tab first — and each one is pulled
+// forward to sit immediately behind the last target tab, pushing every tab
+// after it one slot along. Running out of spare empty tabs is a hard failure
+// that rolls the whole operation back.
 //
 // Planning is pure (_ssPlanSort touches no bytes), so the "how many extra
 // tabs do we need" search happens entirely before anything is written and the
 // no-room case fails without having changed a thing.
-function _ssPrepareInPlaceSort(mode, sourceIdxs) {
+function _ssPrepareInPlaceSort(mode, sourceIdxs, destIdxs) {
   const sources = [...sourceIdxs].sort((a, b) => a - b);
   if (!sources.length) return { error: 'noSource' };
-  const lastSource = sources[sources.length - 1];
+  const sourceSet = new Set(sources);
+  const dests = [...new Set(destIdxs)].filter(i => sourceSet.has(i)).sort((a, b) => a - b);
+  if (!dests.length) return { error: 'noDest' };
+  const lastDest = dests[dests.length - 1];
 
-  // Only empty tabs BEHIND the last source tab are eligible: those are the
-  // ones that can be pulled forward without disturbing the source tabs' own
-  // positions. Last one first, matching "take the last empty tab".
+  // Only empty tabs BEHIND the last target are eligible: those are the ones
+  // that can be pulled forward without disturbing the targets' own positions.
+  // Last one first, matching "take the last empty tab".
   const emptyPool = _ssRegularTabIndices()
-    .filter(i => i > lastSource && !sources.includes(i) && _ssTabStats(i, mode).total === 0)
+    .filter(i => i > lastDest && !dests.includes(i) && _ssTabStats(i, mode).total === 0)
     .sort((a, b) => b - a);
 
   let extras = [];
-  let plan = _ssPlanSort(sources, sources, mode);
+  let plan = _ssPlanSort(sources, dests, mode);
   while (!plan.ok && plan.needsTab && extras.length < emptyPool.length) {
     extras = emptyPool.slice(0, extras.length + 1).sort((a, b) => a - b);
-    plan = _ssPlanSort(sources, [...sources, ...extras], mode);
+    plan = _ssPlanSort(sources, [...dests, ...extras], mode);
   }
   if (plan.empty) return { error: 'empty' };
   if (!plan.ok) return { error: 'noRoom', borrowed: extras.length };
-  return { plan, extras, sources, lastSource, mode };
+  return { plan, extras, sources, dests, lastDest, mode };
 }
 
 function _ssApplyInPlaceSort(res) {
@@ -17270,11 +17338,11 @@ function _ssApplyInPlaceSort(res) {
     // run below the tab it is moving, so the later borrowed tabs keep the
     // physical indices they had when this list was built.
     const regular = _ssRegularTabIndices();
-    const lastPos = regular.indexOf(res.lastSource);
+    const lastPos = regular.indexOf(res.lastDest);
     res.extras.forEach((tabIdx, i) => {
-      const destIdx = regular[lastPos + 1 + i];
-      if (destIdx === undefined) throw new Error('no slot behind the last source tab for borrowed tab ' + tabIdx);
-      if (!_ssMoveRegularTabContent(tabIdx, destIdx)) throw new Error('tab move failed for ' + tabIdx);
+      const slotIdx = regular[lastPos + 1 + i];
+      if (slotIdx === undefined) throw new Error('no slot behind the last target tab for borrowed tab ' + tabIdx);
+      if (!_ssMoveRegularTabContent(tabIdx, slotIdx)) throw new Error('tab move failed for ' + tabIdx);
     });
 
     // Structural check. A file that was already irregular when it loaded
@@ -17297,14 +17365,16 @@ function _ssApplyInPlaceSort(res) {
 }
 
 // ── Sort Items modal ──
-// Step 0 picks the sort mode, step 1 picks the tabs. There is no target step:
-// the source tabs are the destination — see _ssPrepareInPlaceSort.
+// Step 0 picks the sort mode, step 1 the tabs to collect from, step 2 which
+// of those tabs the sorted items are allowed to land in — see
+// _ssPrepareInPlaceSort for why those two are separate questions.
 window.openSortItemsModal = function() {
   if (!sharedStashParsed) return;
   _ssSortState = {
     step: 0,
     modeId: SS_SORT_MODES[0].id,
     sourceSel: new Set(),
+    destSel: new Set(),
     sourceFilter: 'all',
   };
   const modal = document.getElementById('ssSortModal');
@@ -17321,6 +17391,7 @@ window.ssSortPickMode = function(modeId) {
   _ssSortState.modeId = modeId;
   _ssSortState.step = 1;
   _ssSortState.sourceSel = new Set();
+  _ssSortState.destSel = new Set();
   _ssSortState.sourceFilter = 'all';
   _renderSsSortModal();
 };
@@ -17328,6 +17399,47 @@ window.ssSortPickMode = function(modeId) {
 window.ssSortBackToModeStep = function() {
   if (!_ssSortState) return;
   _ssSortState.step = 0;
+  _renderSsSortModal();
+};
+
+window.ssSortBackToSourceStep = function() {
+  if (!_ssSortState) return;
+  _ssSortState.step = 1;
+  _renderSsSortModal();
+};
+
+// Every source tab is a target by default — that's the common case, and
+// reserving one for a different category is the deliberate exception.
+window.ssSortGoToDestStep = function() {
+  if (!_ssSortState) return;
+  const mode = _ssCurrentMode();
+  if (!_ssSortState.sourceSel.size) { showPopup(L('ui_ss_sort_pick_source', 'Pick at least one source tab.')); return; }
+  let anyMatch = false;
+  for (const idx of _ssSortState.sourceSel) {
+    if (_ssTabStats(idx, mode).match > 0) { anyMatch = true; break; }
+  }
+  if (!anyMatch) { showPopup(_ssNoMatchMsg(mode)); return; }
+  _ssSortState.destSel = new Set(_ssSortState.sourceSel);
+  _ssSortState.step = 2;
+  _renderSsSortModal();
+};
+
+window.ssSortToggleDest = function(idx) {
+  if (!_ssSortState) return;
+  if (_ssSortState.destSel.has(idx)) _ssSortState.destSel.delete(idx);
+  else if (_ssSortState.sourceSel.has(idx)) _ssSortState.destSel.add(idx);
+  _renderSsSortModal();
+};
+
+window.ssSortSelectAllDests = function() {
+  if (!_ssSortState) return;
+  _ssSortState.destSel = new Set(_ssSortState.sourceSel);
+  _renderSsSortModal();
+};
+
+window.ssSortSelectNoneDests = function() {
+  if (!_ssSortState) return;
+  _ssSortState.destSel.clear();
   _renderSsSortModal();
 };
 
@@ -17368,37 +17480,38 @@ function _ssNoMatchMsg(mode) {
   return Lfmt('ui_ss_sort_no_match', 'No {noun} found in the selected tabs.', { noun: mode.noun() });
 }
 
+// Sets moved, counting only the sorted items — swept strays carry no setGroup.
+function _ssPlanSetCount(plan) {
+  return new Set(plan.placements.map(p => p.mi.setGroup).filter(Boolean)).size;
+}
+
 window.ssSortRun = function() {
   if (!_ssSortState) return;
   const mode = _ssCurrentMode();
   if (!_ssSortState.sourceSel.size) { showPopup(L('ui_ss_sort_pick_source', 'Pick at least one source tab.')); return; }
+  if (!_ssSortState.destSel.size) { showPopup(L('ui_ss_sort_pick_dest', 'Pick at least one target tab.')); return; }
 
-  let anyMatch = false;
-  for (const idx of _ssSortState.sourceSel) {
-    if (_ssTabStats(idx, mode).match > 0) { anyMatch = true; break; }
-  }
-  if (!anyMatch) { showPopup(_ssNoMatchMsg(mode)); return; }
-
-  const res = _ssPrepareInPlaceSort(mode, [..._ssSortState.sourceSel]);
+  const res = _ssPrepareInPlaceSort(mode, [..._ssSortState.sourceSel], [..._ssSortState.destSel]);
   if (res.error === 'empty' || res.error === 'noSource') { showPopup(_ssNoMatchMsg(mode)); return; }
+  if (res.error === 'noDest') { showPopup(L('ui_ss_sort_pick_dest', 'Pick at least one target tab.')); return; }
   if (res.error === 'noRoom') {
     showPopup(Lfmt('ui_ss_sort_no_empty_tab',
-      'Not enough room: the selected tabs plus every spare empty tab behind them ({borrowed} used) still cannot hold everything. Nothing was changed.',
+      'Not enough room: the target tabs plus every spare empty tab behind them ({borrowed} used) still cannot hold everything. Nothing was changed.',
       { borrowed: res.borrowed }));
     return;
   }
 
   const itemTotal = res.plan.placements.reduce((s, p) => s + 1 + p.mi.children.length, 0);
-  const tabLabels = res.sources.map(i => _ssRegularTabLabel(i)).join(', ');
+  const tabLabels = res.dests.map(i => _ssRegularTabLabel(i)).join(', ');
   let msg = (res.plan.mode && res.plan.mode.atomicSets)
     ? Lfmt('ui_ss_sort_confirm_msg', 'Move {sets} set(s) ({items} item(s)) into: {tabs}?',
-        { sets: new Set(res.plan.placements.map(p => p.mi.setGroup)).size, items: itemTotal, tabs: tabLabels })
+        { sets: _ssPlanSetCount(res.plan), items: itemTotal, tabs: tabLabels })
     : Lfmt('ui_ss_sort_confirm_msg_generic', 'Move {items} item(s) into: {tabs}?',
         { items: itemTotal, tabs: tabLabels });
   if (res.extras.length) {
     msg += ' ' + Lfmt('ui_ss_sort_confirm_borrow',
       '{n} empty tab(s) will be pulled in behind {last}, shifting every later tab one place along.',
-      { n: res.extras.length, last: _ssRegularTabLabel(res.lastSource) });
+      { n: res.extras.length, last: _ssRegularTabLabel(res.lastDest) });
   }
 
   closeSsSortModal();
@@ -17410,10 +17523,10 @@ window.ssSortRun = function() {
         { detail: applied.detail }));
       return;
     }
-    const tabsUsed = res.sources.length + res.extras.length;
+    const tabsUsed = res.dests.length + res.extras.length;
     if (res.plan.mode && res.plan.mode.atomicSets) {
       showPopup(Lfmt('ui_ss_sort_done', 'Sorted {sets} set(s) ({items} item(s)) across {tabs} tab(s).',
-        { sets: new Set(res.plan.placements.map(p => p.mi.setGroup)).size, items: itemTotal, tabs: tabsUsed }));
+        { sets: _ssPlanSetCount(res.plan), items: itemTotal, tabs: tabsUsed }));
     } else {
       showPopup(Lfmt('ui_ss_sort_done_generic', 'Sorted {items} item(s) across {tabs} tab(s).',
         { items: itemTotal, tabs: tabsUsed }));
@@ -17462,9 +17575,9 @@ function _renderSsSortModal() {
     html += `<div class="modal-footer">`
           + `<button type="button" class="btn btn-primary" style="opacity:0.7" onclick="closeSsSortModal()">${esc(L('ui_cancel', 'Cancel'))}</button>`
           + `</div>`;
-  } else {
-    html += `<div class="modal-title">${esc(Lfmt('ui_ss_sort_step1_title3', 'Sort {mode} — Choose Tabs', { mode: mode.label() }))}</div>`;
-    html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(Lfmt('ui_ss_sort_step1_hint3', 'The {noun} in these tabs get sorted back into these same tabs. If they no longer fit, spare empty tabs are pulled in from the end of the stash, right behind the last tab you pick.', { noun: mode.noun() }))}</div>`;
+  } else if (st.step === 1) {
+    html += `<div class="modal-title">${esc(Lfmt('ui_ss_sort_step1_title4', 'Sort {mode} — Choose Source Tabs', { mode: mode.label() }))}</div>`;
+    html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(Lfmt('ui_ss_sort_step1_hint4', 'Tabs to collect {noun} from. You pick where they end up in the next step.', { noun: mode.noun() }))}</div>`;
 
     html += filterRow(st.sourceFilter, 'ssSortSetSourceFilter');
 
@@ -17493,6 +17606,40 @@ function _renderSsSortModal() {
 
     html += `<div class="modal-footer">`
           + `<button type="button" class="btn" style="margin:0" onclick="ssSortBackToModeStep()">${esc(L('ui_back', 'Back'))}</button>`
+          + `<button type="button" class="btn btn-primary" onclick="ssSortGoToDestStep()">${esc(L('ui_ss_sort_next_dest', 'Next: Choose Target Tabs'))}</button>`
+          + `<button type="button" class="btn btn-primary" style="opacity:0.7" onclick="closeSsSortModal()">${esc(L('ui_cancel', 'Cancel'))}</button>`
+          + `</div>`;
+  } else {
+    html += `<div class="modal-title">${esc(Lfmt('ui_ss_sort_step2_title3', 'Sort {mode} — Choose Target Tabs', { mode: mode.label() }))}</div>`;
+    html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(Lfmt('ui_ss_sort_step2_hint3', 'Which of the source tabs the sorted {noun} may land in — unticking one keeps it reserved for whatever else you store there. Anything already in a target tab that this mode does not sort gets pushed below the sorted block. If the targets run out of room, spare empty tabs are pulled in from the end of the stash, right behind the last target.', { noun: mode.noun() }))}</div>`;
+
+    html += `<div style="display:flex;gap:8px;margin-bottom:10px">`
+          + `<button type="button" class="btn" style="margin:0" onclick="ssSortSelectAllDests()">${esc(L('ui_ss_select_all', 'Select All'))}</button>`
+          + `<button type="button" class="btn" style="margin:0" onclick="ssSortSelectNoneDests()">${esc(L('ui_ss_select_none', 'Select None'))}</button>`
+          + `</div>`;
+
+    const srcIndices = [...st.sourceSel].sort((a, b) => a - b);
+    html += `<div style="max-height:340px;overflow-y:auto;border:1px solid var(--d2-border);border-radius:2px;margin-bottom:14px">`;
+    for (const idx of srcIndices) {
+      const stats = _ssTabStats(idx, mode);
+      const checked = st.destSel.has(idx);
+      const strays = stats.total - stats.match;
+      html += `<div onclick="ssSortToggleDest(${idx})" style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--d2-border);background:${checked ? 'rgba(200,168,75,0.10)' : 'transparent'}">`
+            + `<div style="display:flex;align-items:center;gap:10px">`
+            + `<input type="checkbox" ${checked ? 'checked' : ''} style="accent-color:var(--d2-gold);pointer-events:none">`
+            + `<span style="font-family:'Cinzel',serif;font-size:13px;color:var(--d2-gold)">${esc(_ssRegularTabLabel(idx))}</span>`
+            + `</div>`
+            + `<div style="font-size:11px;color:var(--d2-text-dim)">${esc(statsText(stats))}`
+            + (checked && strays > 0
+                ? ` · ${esc(Lfmt('ui_ss_sort_strays', '{n} to be pushed down', { n: strays }))}`
+                : '')
+            + `</div>`
+            + `</div>`;
+    }
+    html += `</div>`;
+
+    html += `<div class="modal-footer">`
+          + `<button type="button" class="btn" style="margin:0" onclick="ssSortBackToSourceStep()">${esc(L('ui_back', 'Back'))}</button>`
           + `<button type="button" class="btn btn-primary" onclick="ssSortRun()">${esc(L('ui_ss_sort_run', 'Sort These Tabs'))}</button>`
           + `<button type="button" class="btn btn-primary" style="opacity:0.7" onclick="closeSsSortModal()">${esc(L('ui_cancel', 'Cancel'))}</button>`
           + `</div>`;
