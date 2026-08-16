@@ -7506,6 +7506,9 @@ async function autoSaveSharedStash() {
   // features land the debounce is already in place.
   if (!sharedStashData) return;
   if (!_fileHandles.sharedStash) return;
+  // Same gate as the manual save — auto-save writes straight over the user's
+  // real SharedStash.d2i, so a damaged file must never get that far.
+  if (_ssBlockedFromSaving()) return;
   const genAtStart = _editGen.sharedStash;
   await writeHandle('sharedStash', new Uint8Array(sharedStashData));
   if (_editGen.sharedStash === genAtStart) {
@@ -15869,8 +15872,109 @@ function renderSharedStash(c) {
 // editor-invented formats, the real SharedStash.d2i has no checksum field to
 // recompute: bytes 12-15 are gold (see parseSharedStash), not a checksum, so
 // this writes sharedStashData out verbatim.
+// ── .d2i section-chain integrity check ──
+// The game client does NOT find sections by scanning for "JM" markers the way
+// this app's parser does. It starts at offset 0 and walks section to section
+// using each 64-byte page header's own length field (sectionStart+16),
+// checking the 0x55AA55AA magic at every stop. That means a length field and
+// its section's real byte span can drift apart while every JM marker still
+// lines up perfectly — the app re-parses the file happily, the client hits a
+// bad magic and bails to character select. This validates the file the way
+// the client does, so a broken chain can never reach disk.
+//
+// Returns null when the chain is intact, or a human-readable reason string.
+function validateSharedStashChain(buf) {
+  if (!buf || buf.length < 0x44) return 'file is too small to contain a stash page';
+  let off = 0, n = 0;
+  while (off + 0x40 <= buf.length) {
+    const magic = readU32LE(buf, off);
+    if (magic !== 0xaa55aa55) {
+      return `page ${n} at byte ${off} does not start with the 0x55AA55AA marker `
+           + `(found 0x${magic.toString(16).toUpperCase().padStart(8, '0')}) — `
+           + `the previous page's stored length is wrong`;
+    }
+    const len = readU32LE(buf, off + 16);
+    // 68 = 64-byte header + "JM" + u16 count, the smallest legal page.
+    if (len < 68) return `page ${n} at byte ${off} claims a length of ${len}, below the 68-byte minimum`;
+    if (off + len > buf.length) return `page ${n} at byte ${off} claims a length of ${len}, which runs past the end of the file`;
+    // Only item pages carry a "JM" list. Real files end with a pageType=2
+    // page that has none, so the marker is checked for item pages only.
+    const pageType = readU32LE(buf, off + 0x14);
+    if ((pageType === 0 || pageType === 1) &&
+        (buf[off + 0x40] !== 0x4a || buf[off + 0x41] !== 0x4d)) {
+      return `page ${n} at byte ${off} is missing its "JM" item marker`;
+    }
+    off += len;
+    n++;
+  }
+  if (off !== buf.length) {
+    return `the page chain ends at byte ${off} but the file is ${buf.length} bytes — `
+         + `${buf.length - off} trailing byte(s) belong to no page`;
+  }
+  return null;
+}
+
+// Second-level check: page structure can be perfect while the ITEM list
+// inside a page is not. Records pack solid — a page's payload is exactly its
+// records back to back — so a page whose records don't tile its payload will
+// desync the client's sequential item decode even though every page header
+// still checks out.
+//
+// pageType=1 (specialty gem/rune page) is skipped — its AdvancedStashStackable
+// entries don't follow the parent/storage placement rules this relies on.
+//
+// Returns null when every page's records are sound, else a reason string.
+function validateSharedStashRecords() {
+  if (!sharedStashParsed || !sharedStashParsed.tabs) return null;
+  const tabs = sharedStashParsed.tabs;
+  for (let i = 0; i < tabs.length; i++) {
+    const t = tabs[i];
+    if (t.pageType !== 0) continue;
+    const start = t.jmOff + 4;
+    const payload = t.sectionEnd - start;
+    if (t.items.length !== t.count) {
+      return `page ${i} says it holds ${t.count} item(s) but only ${t.items.length} could be located`;
+    }
+    if (t.count === 0) {
+      if (payload !== 0) return `page ${i} is empty but still carries ${payload} byte(s) of item data`;
+      continue;
+    }
+    if (t.items[0].byteOffset !== start) {
+      return `page ${i}'s first item starts ${t.items[0].byteOffset - start} byte(s) away from the start of its list`;
+    }
+    for (let k = 1; k < t.items.length; k++) {
+      const gap = t.items[k].byteOffset - t.items[k - 1].byteOffset;
+      if (gap < 20) return `page ${i}: item ${k + 1} begins only ${gap} byte(s) after item ${k} — too short to be a whole record`;
+    }
+    const tail = t.sectionEnd - t.items[t.items.length - 1].byteOffset;
+    if (tail < 20 || tail > 512) return `page ${i}'s last item spans ${tail} byte(s), which is not a plausible record size`;
+  }
+  return null;
+}
+
+// Whether the file was structurally sound when it was loaded. Set by
+// _loadSharedStashCore. The save gate only fires on damage THIS session
+// introduced — if a file already failed on the way in, blocking its save
+// would just trap the user with no way to write anything back out.
+let _ssChainOkAtLoad = false;
+
+// Shared gate for both save paths. Refusing to write is the right call here:
+// the in-memory buffer is still recoverable via Undo, but an overwritten
+// SharedStash.d2i is not.
+function _ssBlockedFromSaving() {
+  if (!_ssChainOkAtLoad) return false;
+  const problem = validateSharedStashChain(sharedStashData) || validateSharedStashRecords();
+  if (!problem) return false;
+  console.error('Shared Stash save blocked — ' + problem);
+  showPopup(Lfmt('ui_ss_chain_broken',
+    'Save cancelled: this Shared Stash\'s page structure is damaged and the game would refuse to load it ({reason}). Use Undo to step back, then reload the original .d2i if the problem persists.',
+    { reason: problem }));
+  return true;
+}
+
 window.saveSharedStashFile = function() {
   if (!sharedStashData) { showPopup(L('ui_ss_no_data','No shared stash data to save.')); return; }
+  if (_ssBlockedFromSaving()) return;
   const blob = new Blob([sharedStashData], { type: 'application/octet-stream' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -15909,7 +16013,13 @@ function _loadSharedStashCore(file, onLoaded) {
     sharedStashName = file.name;
     sharedStashOpenTab = '';
     sharedStashDirty = false;
+    // Baseline for the save gate — see _ssBlockedFromSaving. Records are
+    // checked after the parse, since that check reads sharedStashParsed.
+    const chainProblem = validateSharedStashChain(buf);
     parseSharedStash();
+    const loadProblem = chainProblem || validateSharedStashRecords();
+    _ssChainOkAtLoad = (loadProblem === null);
+    if (loadProblem) console.warn('Shared Stash was already structurally irregular on load — ' + loadProblem);
     onLoaded();
   };
   reader.readAsArrayBuffer(file);
@@ -15944,6 +16054,40 @@ window.loadSharedStashFromStart = function(file) {
     maybeCaptureAutoSaveHandle('sharedStash');
   });
 };
+
+// Chooses which of the loose byte-scan candidates are real item records.
+// See the call site in parseSharedStash for why byte order alone is not enough.
+//
+//   top-level : parent=0, storage=5 — an item sitting in the stash grid.
+//   child     : parent=6           — a gem/rune inside another item's socket.
+//               These are counted in the JM header's `count` too, so a page
+//               holding socketed items has fewer top-level records than `count`
+//               and the shortfall has to be made up from the child candidates.
+//
+// pageType=1 (Reimagined's specialty gem/rune page) stores its entries in the
+// AdvancedStashStackable layout, where these bit positions mean something else
+// entirely — its unfiltered candidate list already matches `count` exactly, so
+// it keeps the original behaviour.
+function _selectStashRecords(candidates, count, isSpecialtyTab) {
+  if (isSpecialtyTab) return candidates.slice(0, count);
+
+  const topLevel = candidates.filter(c => c.parent === 0 && c.storage === 5);
+  if (topLevel.length === count) return topLevel;
+  if (topLevel.length > count) return topLevel.slice(0, count);
+
+  // Short of `count`: the page holds socketed items, so fold the child
+  // candidates back in (byte order, since a child always trails its parent).
+  const merged = topLevel
+    .concat(candidates.filter(c => c.parent === 6))
+    .sort((a, b) => a.byteOffset - b.byteOffset);
+  if (merged.length >= count) return merged.slice(0, count);
+
+  // Still short — the placement filter rejected something it should not have.
+  // Fall back to the original unfiltered cap rather than hiding real items.
+  console.warn(`parseSharedStash: page at 0x${(candidates[0]?.byteOffset ?? 0).toString(16)} `
+    + `expected ${count} records but placement filtering found ${merged.length}; using unfiltered scan`);
+  return candidates.slice(0, count);
+}
 
 function parseSharedStash() {
   const buf = sharedStashData;
@@ -15992,13 +16136,36 @@ function parseSharedStash() {
     const count = buf[jmOff + 2] | (buf[jmOff + 3] << 8);
     const nextJm = t + 1 < jmPositions.length ? jmPositions[t + 1] : buf.length;
     const itemStart = jmOff + 4;
-    const endOff = nextJm;
 
     // pageType at sectionStart+0x14 (u32 LE). See doc/ARCHITECTURE.md § .d2i
     // section layout. Computed up here (instead of after the item loop where
     // it used to live) because the item loop needs it: pageType=1 specialty
     // tabs carry per-item Reimagined qty fields that we read inline.
     const sectionStart = jmOff - 0x40;
+
+    // ── True end of this section's item payload ──
+    // A .d2i section is [64-byte page header][ "JM" ][u16 count][items...],
+    // and the NEXT section's 64-byte header begins immediately after this
+    // section's last byte. So the payload ends at the next section's START
+    // (nextJm - 0x40), NOT at the next JM marker — those differ by exactly
+    // the 64 header bytes. Using nextJm as "the end of this tab" lets item
+    // spans swallow the next section's 0x55AA55AA magic, which the real
+    // game client rejects outright (this app's own JM-rescan parser never
+    // notices, because it re-derives boundaries from the JM markers that
+    // the overrun leaves intact). The section's own stored length field
+    // (sectionStart+16) is the authoritative value the client walks with,
+    // so prefer it and take the tighter of the two.
+    const nextSectionStart = t + 1 < jmPositions.length ? (jmPositions[t + 1] - 0x40) : buf.length;
+    let sectionEnd = nextSectionStart;
+    if (sectionStart >= 0 && sectionStart + 20 <= buf.length) {
+      const storedLen = (buf[sectionStart+16] | (buf[sectionStart+17]<<8)
+                       | (buf[sectionStart+18]<<16) | (buf[sectionStart+19]<<24)) >>> 0;
+      // 68 = 64-byte header + "JM" + u16 count, the smallest legal section.
+      if (storedLen >= 68 && sectionStart + storedLen <= buf.length) {
+        sectionEnd = Math.min(sectionEnd, sectionStart + storedLen);
+      }
+    }
+    const endOff = sectionEnd;
     const pageTypeOff = sectionStart + 0x14;
     const pageType = (sectionStart >= 0 && pageTypeOff + 4 <= buf.length)
       ? (buf[pageTypeOff] | (buf[pageTypeOff+1]<<8) | (buf[pageTypeOff+2]<<16) | (buf[pageTypeOff+3]<<24)) >>> 0
@@ -16069,16 +16236,28 @@ function parseSharedStash() {
       }
     }
 
-    // Hard limit: D2 stores the section's item count in the JM header. Take
-    // exactly that many candidates in byte-order — items pack contiguously,
-    // so the first `count` candidates are real and anything past that is
-    // false-positive byte alignment in dead space. Without this cap, a tab
-    // that ends with 200+ bytes of unused space would surface phantom items
-    // (commonly Cham/Lo/Pul runes whose huffman encodings are short enough
-    // to randomly match against zero-padded bytes).
-    const items = candidates.slice(0, count);
+    // Pick the real records out of the candidate list. D2 stores the section's
+    // item count in the JM header, so exactly `count` of these are real and the
+    // rest are byte-alignment coincidences.
+    //
+    // Taking the first `count` in byte order (what this used to do) is wrong:
+    // the scanner's false positives are not confined to trailing dead space,
+    // they also land INSIDE real item records. Each such phantom both invents
+    // an item and pushes a real one off the end of the cap — measured at 606 of
+    // 1925 offsets wrong (31%) on a real 105-page stash. Every downstream byte
+    // operation derives item length from the gap to the next offset, so a
+    // phantom silently truncates its neighbour.
+    //
+    // The reliable discriminator is placement, not position: a record that is
+    // really sitting in a stash grid has parent=0 (top-level) and storage=5
+    // (stash). Phantoms decode to nonsense there (parent=1/3/4/5, storage=0-4/6/7)
+    // because they are reading the middle of somebody else's bit stream.
+    // Filtering on that yields exactly `count` records for all 42 regular pages
+    // of the reference file, with the first landing precisely on jmOff+4 and no
+    // gap smaller than 33 bytes.
+    const items = _selectStashRecords(candidates, count, isSpecialtyTab);
 
-    tabs.push({ jmOff, count, items, pageType });
+    tabs.push({ jmOff, count, items, pageType, sectionEnd });
   }
 
   sharedStashParsed = { gold, tabs };
@@ -17329,21 +17508,26 @@ window.executeGrailTransfer = function(removeOriginals) {
     // items get filtered to their own tab. Without these filters, tab- or
     // section-trailing items get sliced past their actual end byte and the
     // copy lands in grail with a JM marker / next-section bytes embedded.
-    let sourceItems;
+    let sourceItems, sharedOwnerTab = null;
     if (source === 'shared') {
-      const ownerTab = sharedStashParsed
+      sharedOwnerTab = sharedStashParsed
         ? sharedStashParsed.tabs.find(t => t.items.includes(item))
         : null;
-      sourceItems = ownerTab ? ownerTab.items : [];
+      sourceItems = sharedOwnerTab ? sharedOwnerTab.items : [];
     } else {
       const isMerc = !!item.isMerc;
       sourceItems = (parsedChar.items || []).filter(x => !!x.isMerc === isMerc);
     }
 
-    // Section end: corpse JM for char player items; rest fall through to the
-    // JM scan inside getItemBinaryLength (per-tab/per-section).
+    // Section end: corpse JM for char player items; the owning page's own end
+    // for shared-stash items. Leaving the latter at 0 fell through to
+    // getItemBinaryLength's next-JM scan, which lands 0x40 PAST the page (the
+    // next page's 64-byte header sits between the two) — so a tab's last item
+    // got copied with that whole header, magic bytes and all, glued onto it.
     let sectionEnd = 0;
-    if (source !== 'shared' && parsedChar && !item.isMerc) {
+    if (source === 'shared') {
+      if (sharedOwnerTab && typeof sharedOwnerTab.sectionEnd === 'number') sectionEnd = sharedOwnerTab.sectionEnd;
+    } else if (parsedChar && !item.isMerc) {
       const jmOff = parsedChar.itemsOffset;
       if (jmOff >= 0) {
         for (let i = jmOff + 4; i < sourceBuf.length - 1; i++) {
@@ -19713,9 +19897,14 @@ function _resolveSourceForMove(byteOffset) {
         // branch above already guards against.
         //
         // Fix: pass only the owning tab's items + a sectionEnd equal to the
-        // next tab's JM offset (or sharedStashData.length for the last tab).
+        // end of the owning tab's own page. NOT the next tab's JM offset —
+        // that sits 0x40 past this page's last byte, with the next page's
+        // 64-byte header (magic + length field) in between, so a tab's last
+        // item would still slice that header into the copied blob.
         const nextTab = sharedStashParsed.tabs[ti + 1];
-        const sectionEnd = nextTab ? nextTab.jmOff : (sharedStashData ? sharedStashData.length : 0);
+        const sectionEnd = (typeof tab.sectionEnd === 'number')
+          ? tab.sectionEnd
+          : (nextTab ? nextTab.jmOff - 0x40 : (sharedStashData ? sharedStashData.length : 0));
         return {
           kind: 'shared',
           item: it,
