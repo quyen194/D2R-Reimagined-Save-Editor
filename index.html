@@ -9268,6 +9268,11 @@ function buildTabs() {
 }
 function renderTab() {
   const c=document.getElementById('tabContent'); c.innerHTML='';
+  // The shared stash's Apply/Revert bar hangs off <body>, so it has to be
+  // taken down here — switching tabs would otherwise leave it floating over
+  // an unrelated screen. Rendering the shared stash puts it back.
+  const arrangeBar = document.getElementById('ssArrangeBar');
+  if (arrangeBar) arrangeBar.remove();
   switch(activeTab){
     case 'char':      renderChar(c);      break;
     case 'skills':    renderSkills(c);    break;
@@ -15842,18 +15847,19 @@ let sharedStashParsed = null; // { gold, tabs:[{jmOff, count, items:[]}] }
 let sharedStashOpenTab = '';  // id of expanded tab; '' = none. Ids are e.g. 't0' for regular tab 0, or 's5_gems'/'s5_runes'/'s5_mats' for the virtual sub-tabs of specialty section 5.
 
 // Tab-arrange mode: lets the user reorder regular (pageType=0) tabs by drag &
-// drop, trade two tabs' contents outright, and shuffle empty tabs around —
-// see swapSharedStashTabs() / _ssReorderRegularTabs() for why all of this only
-// ever touches each tab's item count + payload bytes, never a 64-byte header.
+// drop, trade two tabs' contents outright, and shuffle empty tabs around.
 //
 // Every operation is a permutation of the regular tabs' CONTENTS across the
 // existing physical slots, so the number of pages in the file never changes:
 // "insert an empty tab" borrows the last empty tab and pulls it forward,
-// "delete an empty tab" pushes it back to the end.
+// "delete an empty tab" pushes it back to the end. Edits are staged in
+// _ssDraft and only reach the bytes on Apply — see _ssReorderRegularTabs()
+// for why writing them only ever touches each tab's item count + payload,
+// never a 64-byte header.
 let _ssSwapMode = false;
-let _ssSwapSelection = [];    // physical tab indices (into sharedStashParsed.tabs), unlimited
-let _ssDragTabs = null;       // physical indices currently being dragged (group), or null
-let _ssDropTarget = null;     // { physicalIdx, before } while a drag hovers a row
+let _ssSwapSelection = [];    // source tab indices (into sharedStashParsed.tabs), unlimited
+let _ssDragTabs = null;       // source tab indices currently being dragged (group), or null
+let _ssDropTarget = null;     // { srcIdx, before } while a drag hovers a row
 
 function renderSharedStash(c) {
   c.innerHTML = `
@@ -16284,75 +16290,11 @@ function parseSharedStash() {
   }
 
   sharedStashParsed = { gold, tabs };
+  // A staged tab arrangement indexes into the layout it was built against, so
+  // it can never outlive a re-parse (a new file, an undo, a sort, or the
+  // apply that consumed it).
+  _ssDraft = null;
   console.log('parseSharedStash: ' + tabs.length + ' tabs, ' + tabs.reduce((s, t) => s + t.items.length, 0) + ' items total');
-}
-
-// Swaps the contents (item count + item payload bytes) of two regular
-// (pageType=0) tabs, leaving both tabs' 64-byte page headers and JM markers
-// untouched and at their original file position.
-//
-// Why headers stay put: gold is stored once, globally, inside the very first
-// tab's own header (byte offset 12-15, ahead of that tab's "JM" marker at
-// 0x40). If we spliced whole sections (header included) — the more obvious
-// "reorder tabs" approach — swapping tab 0 with any other tab would carry
-// the gold field away from offset 12-15 and corrupt it. Every other field
-// this app reads (pageType, item positions, tab boundaries) is derived by
-// re-scanning for "JM" byte markers after every edit, so it doesn't care
-// where a section's bytes physically sit — only gold cares, and gold's
-// position never moves because we never touch bytes before a tab's own
-// count field (jmOff+2).
-function swapSharedStashTabs(idxA, idxB) {
-  if (!sharedStashParsed || !sharedStashData) return;
-  if (idxA === idxB) return;
-  const tabs = sharedStashParsed.tabs;
-  const rawA = tabs[idxA], rawB = tabs[idxB];
-  if (!rawA || !rawB || rawA.pageType !== 0 || rawB.pageType !== 0) return;
-  if (idxA > idxB) { const tmp = idxA; idxA = idxB; idxB = tmp; }
-
-  const sectionStart = (i) => tabs[i].jmOff - 0x40;
-  // The last tab stops at its own stored section length, never at EOF: a real
-  // file can carry further pages past the last JM-bearing one, and the JM scan
-  // cannot see them (Reimagined ships a trailing pageType=2 page with no "JM"
-  // marker). Taking EOF here spliced that page into the other tab's item
-  // payload, which the game client rejects. _ssPayloadEnd knows the boundary.
-  const payloadEnd = (i) => (i + 1 < tabs.length) ? sectionStart(i + 1) : _ssPayloadEnd(i);
-
-  const A = tabs[idxA], B = tabs[idxB];
-  const aFrom = A.jmOff + 2, aTo = payloadEnd(idxA); // count field + item payload
-  const bFrom = B.jmOff + 2, bTo = payloadEnd(idxB);
-
-  const buf = sharedStashData;
-  const pre    = buf.slice(0, aFrom);
-  const aChunk = buf.slice(aFrom, aTo);
-  const mid    = buf.slice(aTo, bFrom);   // untouched tabs (and B's own header+JM) in between
-  const bChunk = buf.slice(bFrom, bTo);
-  const post   = buf.slice(bTo);
-
-  const out = new Uint8Array(pre.length + bChunk.length + mid.length + aChunk.length + post.length);
-  let off = 0;
-  out.set(pre, off);    off += pre.length;
-  out.set(bChunk, off); off += bChunk.length;
-  out.set(mid, off);    off += mid.length;
-  out.set(aChunk, off); off += aChunk.length;
-  out.set(post, off);
-
-  // Each tab's 64-byte header also stores its OWN section byte-length at
-  // relative offset +16 — confirmed empirically against a real
-  // SharedStash.d2i: every tab's value there equals (next tab's
-  // sectionStart − this tab's sectionStart). This field is redundant with
-  // the JM-marker scan this app's own reader uses (so a stale value here
-  // was invisible to our own re-parse), but the real game apparently
-  // trusts this stored length directly — leaving it stale after swapping
-  // two differently-sized tabs is what corrupted the file for the game
-  // even though our own round-trip parse looked fine.
-  const secStartA = aFrom - 66;                                     // A's header position never moves
-  const newBHeaderStart = aFrom + bChunk.length + mid.length - 66;  // B's header relocates
-  writeU32LE(out, secStartA + 16, 66 + bChunk.length);
-  writeU32LE(out, newBHeaderStart + 16, 66 + aChunk.length);
-
-  sharedStashData = out;
-  parseSharedStash();
-  markSharedStashDirty();
 }
 
 // Relocates one regular tab's contents to another regular tab's position,
@@ -16371,17 +16313,29 @@ function _ssMoveRegularTabContent(fromIdx, toIdx) {
   return _ssReorderRegularTabs(order);
 }
 
-// The general form of the above: `order` is a permutation of
+// The one place tab order is written to bytes. `order` is a permutation of
 // _ssRegularTabIndices(), read as "the k-th regular tab (in physical file
 // order) receives the contents that currently live in tab order[k]".
 // Specialty (pageType != 0) tabs are never part of the permutation — they
 // keep their own contents and act as fixed obstacles in the physical layout,
 // so the tab numbering the user sees stays intact.
 //
-// Same invariant as swapSharedStashTabs, and for the same reason: 64-byte
-// page headers never move, only the [count field + item payload] block does.
-// That keeps the global gold field pinned at bytes 12-15 inside the first
-// tab's header.
+// Only each tab's [count field + item payload] block moves; the 64-byte page
+// headers and "JM" markers stay exactly where they are. That matters because
+// gold is stored once, globally, inside the very FIRST tab's own header (byte
+// offset 12-15, ahead of that tab's "JM" marker at 0x40). Splicing whole
+// sections — the more obvious "reorder tabs" approach — would carry the gold
+// field away from offset 12-15 the moment tab 0 moved, and corrupt it. Every
+// other field this app reads (pageType, item positions, tab boundaries) is
+// re-derived by scanning for "JM" markers after each edit, so nothing else
+// cares where a section's bytes physically sit.
+//
+// Each header does store its OWN section byte-length at relative offset +16,
+// and the real game client walks the page chain with that field rather than
+// scanning for "JM" the way this app's reader does. A stale value there is
+// invisible to our own re-parse but sends the client to character select, so
+// every header's length is rewritten below — a permutation can resize many
+// tabs at once, not just the two that traded places.
 //
 // Does NOT mark the file dirty — callers decide (the sort batches its own
 // dirty flag after the whole plan lands).
@@ -16442,23 +16396,113 @@ function _ssReorderRegularTabs(order) {
   return true;
 }
 
-window.toggleSharedStashSwapMode = function() {
-  _ssSwapMode = !_ssSwapMode;
-  _ssSwapSelection = [];
+// ── Draft (staged) tab arrangement ─────────────────────────
+//
+// Nothing the user does in arrange mode touches sharedStashData: drag & drop,
+// insert and remove all edit this draft, the tab list renders FROM the draft,
+// and only Apply hands the finished permutation to _ssReorderRegularTabs.
+// That is what makes the whole arrangement revertable — a byte-level edit
+// would burn the single undo slot on every individual drag.
+//
+//   order   — the draft arrangement, as source tab indices. Position k in
+//             this list is the k-th regular slot on screen; the value is
+//             WHICH tab's contents (and original name) show there.
+//   added   — tabs pulled forward by "+", shown as "Tab Added" until applied.
+//   deleted — tabs marked by "✕", shown struck through in place; Apply sends
+//             them to the end of the file, which is what "removing" a tab
+//             means here (the page count never changes).
+let _ssDraft = null;
+
+function _ssEnsureDraft() {
+  if (!_ssDraft) _ssDraft = { order: _ssRegularTabIndices(), added: new Set(), deleted: new Set() };
+  return _ssDraft;
+}
+
+function _ssDraftOrder() {
+  return _ssDraft ? _ssDraft.order : _ssRegularTabIndices();
+}
+
+// Is there anything to apply? A draft that has been dragged back into its
+// original shape counts as clean, so the Apply bar disappears again.
+function _ssDraftDirty() {
+  if (!_ssDraft) return false;
+  return _ssDraft.added.size > 0 || _ssDraft.deleted.size > 0 || _ssDraftReordered();
+}
+
+function _ssDraftReordered() {
+  if (!_ssDraft) return false;
+  const reg = _ssRegularTabIndices();
+  return !_ssDraft.order.every((v, i) => v === reg[i]);
+}
+
+function _ssStageOrder(order) {
+  const d = _ssEnsureDraft();
+  d.order = order;
+  renderSharedStashTabs();
+}
+
+window.ssApplyTabArrangement = function() {
+  if (!_ssDraft) return;
+  if (!_ssDraftDirty()) { _ssDraft = null; renderSharedStashTabs(); return; }
+  const d = _ssDraft;
+  // Removed tabs are simply the ones that end up last — the file keeps every
+  // page it had, so "delete" can only ever mean "push to the back".
+  const final = d.order.filter(i => !d.deleted.has(i))
+                       .concat(d.order.filter(i => d.deleted.has(i)));
+  if (!_ssReorderRegularTabs(final)) {
+    showPopup(L('ui_ss_arrange_failed', 'Could not rearrange the tabs — the layout was not changed.'));
+    return;
+  }
+  markSharedStashDirty();
+  // Slot ids ('t<idx>') are re-derived from the new layout, so re-point both
+  // the selection and the expanded tab at wherever their contents landed.
+  const reg = _ssRegularTabIndices();
+  const slotOf = new Map();
+  for (let k = 0; k < final.length; k++) slotOf.set(final[k], reg[k]);
+  _ssSwapSelection = _ssSwapSelection.map(i => slotOf.has(i) ? slotOf.get(i) : i);
+  if (sharedStashOpenTab && /^t\d+$/.test(sharedStashOpenTab)) {
+    const openIdx = parseInt(sharedStashOpenTab.slice(1), 10);
+    if (slotOf.has(openIdx)) sharedStashOpenTab = 't' + slotOf.get(openIdx);
+  }
+  _ssDraft = null;
+  renderSharedStashTabs();
+};
+
+window.ssRevertTabArrangement = function() {
+  _ssDraft = null;
   _ssDragTabs = null;
   _ssDropTarget = null;
   renderSharedStashTabs();
 };
 
-window.pickSharedStashTabForSwap = function(physicalIdx) {
+window.toggleSharedStashSwapMode = function() {
+  const leave = () => {
+    _ssSwapMode = !_ssSwapMode;
+    _ssSwapSelection = [];
+    _ssDraft = null;
+    _ssDragTabs = null;
+    _ssDropTarget = null;
+    renderSharedStashTabs();
+  };
+  // Leaving the mode with staged changes would silently throw them away.
+  if (_ssSwapMode && _ssDraftDirty()) {
+    showConfirm(
+      L('ui_ss_arrange_discard', 'Leave arrange mode and discard the pending tab arrangement?'),
+      leave, L('ui_ss_arrange_discard_btn', 'Discard'));
+    return;
+  }
+  leave();
+};
+
+window.pickSharedStashTabForSwap = function(srcIdx) {
   if (!_ssSwapMode || !sharedStashParsed) return;
-  const tab = sharedStashParsed.tabs[physicalIdx];
+  const tab = sharedStashParsed.tabs[srcIdx];
   if (!tab || tab.pageType !== 0) return;
-  const pos = _ssSwapSelection.indexOf(physicalIdx);
+  const pos = _ssSwapSelection.indexOf(srcIdx);
   // No cap on the selection any more: two tabs still means "swap contents",
   // while any number of them can be dragged as one group.
   if (pos !== -1) _ssSwapSelection.splice(pos, 1);
-  else            _ssSwapSelection.push(physicalIdx);
+  else            _ssSwapSelection.push(srcIdx);
   renderSharedStashTabs();
 };
 
@@ -16473,26 +16517,29 @@ window.cancelSharedStashSwapSelection = function() {
 // unselected tabs that happened to sit between them are pushed out of the
 // group and keep their own relative order. Dragging an unselected tab moves
 // just that tab. Specialty tabs are neither draggable nor droppable.
+//
+// Everything below addresses tabs by SOURCE index (which contents), not by
+// screen position, so a selection survives any number of staged moves.
 
-// Selected tabs, in current physical order — the group's own order is
-// preserved, not the order the user happened to click them in.
-function _ssDragGroupFor(physicalIdx) {
-  const order = _ssRegularTabIndices();
-  if (_ssSwapSelection.includes(physicalIdx)) {
+// Selected tabs, in draft order — the group's own order is preserved, not
+// the order the user happened to click them in.
+function _ssDragGroupFor(srcIdx) {
+  const order = _ssDraftOrder();
+  if (_ssSwapSelection.includes(srcIdx)) {
     const group = order.filter(i => _ssSwapSelection.includes(i));
     if (group.length) return group;
   }
-  return [physicalIdx];
+  return [srcIdx];
 }
 
-// The permutation a drop would produce, or null when the drop is a no-op.
-function _ssPlanDropOrder(targetIdx, before) {
+// The draft order a drop would produce, or null when the drop is a no-op.
+function _ssPlanDropOrder(targetSrc, before) {
   if (!_ssDragTabs || !_ssDragTabs.length) return null;
-  const order = _ssRegularTabIndices();
+  const order = _ssDraftOrder();
   const group = _ssDragTabs.filter(i => order.includes(i));
-  if (!group.length || group.includes(targetIdx)) return null;
+  if (!group.length || group.includes(targetSrc)) return null;
   const rest = order.filter(i => !group.includes(i));
-  let pos = rest.indexOf(targetIdx);
+  let pos = rest.indexOf(targetSrc);
   if (pos < 0) return null;              // target is a specialty tab
   if (!before) pos++;
   return rest.slice(0, pos).concat(group, rest.slice(pos));
@@ -16515,46 +16562,45 @@ function _ssClearDropMarkers() {
   for (const el of container.querySelectorAll('[data-ss-row]')) el.style.boxShadow = '';
 }
 
-window.ssTabDragStart = function(ev, physicalIdx) {
+window.ssTabDragStart = function(ev, srcIdx) {
   if (!_ssSwapMode || !sharedStashParsed) return;
-  const tab = sharedStashParsed.tabs[physicalIdx];
+  const tab = sharedStashParsed.tabs[srcIdx];
   if (!tab || tab.pageType !== 0) return;
-  _ssDragTabs = _ssDragGroupFor(physicalIdx);
+  _ssDragTabs = _ssDragGroupFor(srcIdx);
   _ssDropTarget = null;
   if (ev.dataTransfer) {
     ev.dataTransfer.effectAllowed = 'move';
     // Firefox refuses to start a drag unless some payload is set.
-    try { ev.dataTransfer.setData('text/plain', 'ss-tab:' + physicalIdx); } catch (e) {}
+    try { ev.dataTransfer.setData('text/plain', 'ss-tab:' + srcIdx); } catch (e) {}
   }
 };
 
-window.ssTabDragOver = function(ev, physicalIdx) {
+window.ssTabDragOver = function(ev, srcIdx) {
   if (!_ssDragTabs) return;
   const row = ev.currentTarget;
   const rect = row.getBoundingClientRect();
   const before = (ev.clientY - rect.top) < rect.height / 2;
-  if (!_ssPlanDropOrder(physicalIdx, before)) { _ssClearDropMarkers(); _ssDropTarget = null; return; }
+  if (!_ssPlanDropOrder(srcIdx, before)) { _ssClearDropMarkers(); _ssDropTarget = null; return; }
   ev.preventDefault();
   if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'move';
-  _ssDropTarget = { physicalIdx, before };
+  _ssDropTarget = { srcIdx, before };
   _ssPaintDropMarker(row, before);
 };
 
-window.ssTabDrop = function(ev, physicalIdx) {
+window.ssTabDrop = function(ev, srcIdx) {
   if (!_ssDragTabs) return;
   ev.preventDefault();
   ev.stopPropagation();
   const rect = ev.currentTarget.getBoundingClientRect();
-  const before = _ssDropTarget && _ssDropTarget.physicalIdx === physicalIdx
+  const before = _ssDropTarget && _ssDropTarget.srcIdx === srcIdx
     ? _ssDropTarget.before
     : (ev.clientY - rect.top) < rect.height / 2;
-  const order = _ssPlanDropOrder(physicalIdx, before);
-  const group = _ssDragTabs.slice();
+  const order = _ssPlanDropOrder(srcIdx, before);
   _ssDragTabs = null;
   _ssDropTarget = null;
   _ssClearDropMarkers();
   if (!order) { renderSharedStashTabs(); return; }
-  _ssCommitTabOrder(order, group);
+  _ssStageOrder(order);
 };
 
 window.ssTabDragEnd = function() {
@@ -16563,107 +16609,81 @@ window.ssTabDragEnd = function() {
   _ssClearDropMarkers();
 };
 
-// Applies a permutation and keeps the UI pointing at the same CONTENTS the
-// user was working with: the selection stores physical slots, so after the
-// move it has to be re-pointed at wherever `keepContents` ended up.
-function _ssCommitTabOrder(order, keepContents) {
-  const before = _ssRegularTabIndices();
-  if (!_ssReorderRegularTabs(order)) {
-    showPopup(L('ui_ss_arrange_failed', 'Could not rearrange the tabs — the layout was not changed.'));
-    return;
-  }
-  markSharedStashDirty();
-  const after = _ssRegularTabIndices();
-  if (keepContents && keepContents.length) {
-    // order[k] held the contents now sitting in slot after[k].
-    const slotOf = new Map();
-    for (let k = 0; k < order.length; k++) slotOf.set(order[k], after[k]);
-    _ssSwapSelection = keepContents.map(i => slotOf.has(i) ? slotOf.get(i) : i)
-                                   .filter(i => after.includes(i));
-  }
-  // The open tab is addressed by slot id ('t<physicalIdx>'), and slots that
-  // still exist keep their ids — but the contents behind them moved, so
-  // collapse rather than leave the user staring at a different tab's grid.
-  if (sharedStashOpenTab && /^t\d+$/.test(sharedStashOpenTab)) {
-    const openIdx = parseInt(sharedStashOpenTab.slice(1), 10);
-    if (before.includes(openIdx)) sharedStashOpenTab = '';
-  }
-  renderSharedStashTabs();
-}
-
 // ── Insert / remove empty tabs ─────────────────────────────
 //
 // Neither of these changes how many pages the file holds — an inserted empty
-// tab is BORROWED from the last empty tab in the file, and a removed one is
-// pushed back to the end. That keeps the page chain (and the gold field in
-// tab 0's header) exactly as long as it was.
+// tab is BORROWED from the last empty tab, and a removed one is pushed back
+// to the end. That keeps the page chain (and the gold field in tab 0's
+// header) exactly as long as it was. Both are staged like every other
+// arrange-mode edit and only reach the bytes on Apply.
 
-// The last empty regular tab, scanning from the end — the one an insert
-// borrows. Returns -1 when every regular tab holds something.
+// The empty tab an insert would borrow: the last one in draft order that
+// still holds nothing and isn't already marked for removal. -1 when there is
+// none, which is what disables the + buttons.
 function _ssLastEmptyRegularTab() {
   if (!sharedStashParsed) return -1;
-  const order = _ssRegularTabIndices();
+  const order = _ssDraftOrder();
   for (let k = order.length - 1; k >= 0; k--) {
-    if (sharedStashParsed.tabs[order[k]].items.length === 0) return order[k];
+    const idx = order[k];
+    if (_ssDraft && _ssDraft.deleted.has(idx)) continue;
+    if (sharedStashParsed.tabs[idx].items.length === 0) return idx;
   }
   return -1;
 }
 
-window.ssInsertEmptyTabBefore = function(physicalIdx) {
+window.ssInsertEmptyTabBefore = function(srcIdx) {
   if (!_ssSwapMode || !sharedStashParsed) return;
-  const order = _ssRegularTabIndices();
-  if (!order.includes(physicalIdx)) return;
-  const src = _ssLastEmptyRegularTab();
-  if (src < 0) {
+  const borrow = _ssLastEmptyRegularTab();
+  if (borrow < 0) {
     // The button is disabled in this state; this is the belt-and-braces path.
     showPopup(L('ui_ss_no_empty_tab', 'No empty tab left to insert — every tab holds items.'));
     return;
   }
-  if (src === physicalIdx) return;                     // already an empty slot here
-  const rest = order.filter(i => i !== src);
-  const pos = rest.indexOf(physicalIdx);
+  if (borrow === srcIdx) return;                       // already an empty slot here
+  const d = _ssEnsureDraft();
+  const rest = d.order.filter(i => i !== borrow);
+  const pos = rest.indexOf(srcIdx);
   if (pos < 0) return;
-  _ssCommitTabOrder(rest.slice(0, pos).concat([src], rest.slice(pos)), _ssSwapSelection.slice());
+  d.order = rest.slice(0, pos).concat([borrow], rest.slice(pos));
+  d.added.add(borrow);
+  d.deleted.delete(borrow);
+  renderSharedStashTabs();
 };
 
-window.ssDeleteEmptyTab = function(physicalIdx) {
+// One button, three meanings, all staged: un-mark a tab already marked for
+// removal, take back a pending insert (the tab goes back to the end), or
+// mark an empty tab for removal.
+window.ssDeleteEmptyTab = function(srcIdx) {
   if (!_ssSwapMode || !sharedStashParsed) return;
-  const tab = sharedStashParsed.tabs[physicalIdx];
+  const tab = sharedStashParsed.tabs[srcIdx];
   if (!tab || tab.pageType !== 0) return;
+  const d = _ssEnsureDraft();
+  if (d.deleted.has(srcIdx)) { d.deleted.delete(srcIdx); renderSharedStashTabs(); return; }
   if (tab.items.length !== 0) {
     showPopup(L('ui_ss_not_empty_tab', 'Only an empty tab can be removed — move its items out first.'));
     return;
   }
-  const order = _ssRegularTabIndices();
-  const rest = order.filter(i => i !== physicalIdx);
-  if (rest.length === order.length) return;
-  _ssCommitTabOrder(rest.concat([physicalIdx]), _ssSwapSelection.slice());
+  if (d.added.has(srcIdx)) {
+    d.added.delete(srcIdx);
+    d.order = d.order.filter(i => i !== srcIdx).concat([srcIdx]);
+    renderSharedStashTabs();
+    return;
+  }
+  d.deleted.add(srcIdx);
+  renderSharedStashTabs();
 };
 
+// Staged like the rest: the two tabs simply trade places in the draft order.
 window.confirmSharedStashSwapSelection = function() {
   if (_ssSwapSelection.length !== 2 || !sharedStashParsed) return;
-  const [idxA, idxB] = _ssSwapSelection;
-  const labelFor = (idx) => {
-    let regularIdx = 0;
-    for (let t = 0; t <= idx; t++) {
-      if (sharedStashParsed.tabs[t].pageType !== 1) regularIdx++;
-    }
-    return `${L('ui_ss_tab_prefix','Tab')} ${regularIdx}`;
-  };
-  const nameA = labelFor(idxA), nameB = labelFor(idxB);
-  const countA = sharedStashParsed.tabs[idxA].items.length;
-  const countB = sharedStashParsed.tabs[idxB].items.length;
-  showConfirm(
-    Lfmt('ui_ss_swap_confirm',
-      'Swap all contents between {a} ({aCount} item(s)) and {b} ({bCount} item(s))? Grid positions within each tab stay the same — only the two tabs trade contents.',
-      { a: nameA, aCount: countA, b: nameB, bCount: countB }),
-    () => {
-      swapSharedStashTabs(idxA, idxB);
-      _ssSwapSelection = [];
-      renderSharedStashTabs();
-    },
-    L('ui_ss_swap_confirm_btn', 'Swap')
-  );
+  const [a, b] = _ssSwapSelection;
+  const d = _ssEnsureDraft();
+  const ia = d.order.indexOf(a), ib = d.order.indexOf(b);
+  if (ia < 0 || ib < 0) return;
+  d.order[ia] = b;
+  d.order[ib] = a;
+  _ssSwapSelection = [];
+  renderSharedStashTabs();
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -17280,7 +17300,7 @@ function _ssConcatU8(chunks) {
 // Cuts a batch of item byte-ranges (each already spanning parent + its
 // socketed children) out of one shared-stash tab's payload in a single
 // splice, then fixes up that tab's JM item-count field and its own 64-byte
-// header's section-length field — see swapSharedStashTabs for why the
+// header's section-length field — see _ssReorderRegularTabs for why the
 // latter matters even though this app's own parser re-derives everything by
 // re-scanning for JM markers: the real client trusts the stored length.
 function _ssRemoveItemsFromTab(physicalIdx, ranges) {
@@ -17572,6 +17592,13 @@ function _ssApplyInPlaceSort(res) {
 // _ssPrepareInPlaceSort for why those two are separate questions.
 window.openSortItemsModal = function() {
   if (!sharedStashParsed) return;
+  // The sort rewrites tab contents, which would leave a staged arrangement
+  // pointing at tabs that no longer hold what the preview showed.
+  if (_ssDraftDirty()) {
+    showPopup(L('ui_ss_arrange_pending_block',
+      'Apply or revert the pending tab arrangement before sorting.'));
+    return;
+  }
   _ssSortState = {
     step: 0,
     modeId: SS_SORT_MODES[0].id,
@@ -17886,12 +17913,27 @@ function renderSharedStashTabs() {
 
   const stashW = 16, stashH = 13, cellPx = 29;
 
+  // Each regular tab's name comes from where its contents sit in the FILE, so
+  // it is resolved before any staged arrangement is applied. A dragged tab
+  // therefore carries its own name to its new position and the list only
+  // renumbers once the user hits Apply.
+  const nameOfTab = new Map();
+  let numbered = 0;
+  for (let t = 0; t < sharedStashParsed.tabs.length; t++) {
+    if (sharedStashParsed.tabs[t].pageType === 1) continue;
+    numbered++;
+    nameOfTab.set(t, `${L('ui_ss_tab_prefix','Tab')} ${numbered}`);
+  }
+
   // Flatten physical tabs into a list of virtual tabs. pageType=1 (specialty
   // section) becomes 3 virtual sub-tabs (Gems / Runes / Materials) so the
   // editor matches the 3 visual panels the in-game UI splits this section
-  // into. pageType=0 tabs render as the normal numbered tabs.
+  // into. pageType=0 tabs render as the normal numbered tabs — but which tab
+  // shows in which slot is read from the draft arrangement, so the whole list
+  // is a preview until Apply.
+  const draftOrder = _ssDraftOrder();
   const vtabs = [];
-  let regularIdx = 0;
+  let slot = 0;
   let seenSpecialty = false; // regular tabs after the specialty section are Reimagined-added, not vanilla D2R
   for (let t = 0; t < sharedStashParsed.tabs.length; t++) {
     const tab = sharedStashParsed.tabs[t];
@@ -17908,8 +17950,19 @@ function renderSharedStashTabs() {
       vtabs.push({ id: 's'+t+'_mats',  label: L('ui_ss_cat_materials','Materials'), items: mats,  kind: 'specialty', physicalIdx: t });
       seenSpecialty = true;
     } else {
-      regularIdx++;
-      vtabs.push({ id: 't'+t, label: `${L('ui_ss_tab_prefix','Tab')} ${regularIdx}`, items: tab.items, kind: 'regular', physicalIdx: t, isMod: seenSpecialty });
+      // physicalIdx is the SOURCE tab (whose contents and name these are),
+      // not the slot it is drawn in — every handler addresses tabs that way.
+      const src = draftOrder[slot++];
+      if (src === undefined) continue;
+      const isAdded = !!(_ssDraft && _ssDraft.added.has(src));
+      vtabs.push({
+        id: 't' + src,
+        label: isAdded ? L('ui_ss_tab_added', 'Tab Added') : nameOfTab.get(src),
+        items: sharedStashParsed.tabs[src].items,
+        kind: 'regular', physicalIdx: src, isMod: seenSpecialty,
+        pendingAdd: isAdded,
+        pendingDelete: !!(_ssDraft && _ssDraft.deleted.has(src)),
+      });
     }
   }
 
@@ -17938,7 +17991,7 @@ function renderSharedStashTabs() {
   const spareEmptyIdx = _ssSwapMode ? _ssLastEmptyRegularTab() : -1;
   if (_ssSwapMode) {
     html += `<div style="color:var(--d2-text-dim);font-size:11.5px;margin-bottom:10px;font-style:italic;line-height:1.6">`
-          + esc(L('ui_ss_arrange_hint', 'Drag a tab by its header to move it. Selected tabs travel together as one group — unselected tabs caught between them are pushed out and keep their order. Select exactly two tabs to trade their contents instead. + inserts an empty tab here (borrowed from the last empty tab); ✕ sends an empty tab back to the end, so the tab count never changes. Gems / Runes / Materials share one physical tab and cannot be moved.'))
+          + esc(L('ui_ss_arrange_hint', 'Nothing here is written to the file until you press Apply — everything below is a preview you can revert. Drag a tab by its header to move it. Selected tabs travel together as one group — unselected tabs caught between them are pushed out and keep their order. Select exactly two tabs to trade their contents instead. + inserts an empty tab here (borrowed from the last empty tab); ✕ marks an empty tab for removal, which sends it to the end. The tab count never changes, and tabs keep their current names until you apply.'))
           + `</div>`;
     if (spareEmptyIdx < 0) {
       html += `<div style="color:var(--d2-text-dim);font-size:11.5px;margin-bottom:10px;font-style:italic">`
@@ -17976,7 +18029,12 @@ function renderSharedStashTabs() {
       ? ` data-ss-row="${vt.physicalIdx}" ondragover="ssTabDragOver(event,${vt.physicalIdx})"`
         + ` ondrop="ssTabDrop(event,${vt.physicalIdx})"`
       : '';
-    html += `<div${rowAttrs} style="background:var(--d2-surface2);border:1px solid ${rowBorder};border-radius:4px;margin-bottom:8px;overflow:hidden${isSelected ? ';box-shadow:0 0 0 1px var(--d2-gold-bright)' : ''}">`;
+    // A tab staged for removal stays exactly where it is, struck through, so
+    // the user can see what is about to go and take it back before applying.
+    const rowStyle = vt.pendingDelete
+      ? `border-color:var(--d2-red,#8a2a2a);opacity:0.6`
+      : (vt.pendingAdd ? `border-color:var(--d2-green,#2a5a2a)` : '');
+    html += `<div${rowAttrs} style="background:var(--d2-surface2);border:1px solid ${rowBorder};border-radius:4px;margin-bottom:8px;overflow:hidden${isSelected ? ';box-shadow:0 0 0 1px var(--d2-gold-bright)' : ''}${rowStyle ? ';' + rowStyle : ''}">`;
     const headAttrs = dnd
       ? ` draggable="true" ondragstart="ssTabDragStart(event,${vt.physicalIdx})" ondragend="ssTabDragEnd()"`
       : '';
@@ -17997,7 +18055,12 @@ function renderSharedStashTabs() {
       html += `<span title="${esc(L('ui_ss_drag_handle_title','Drag to move this tab'))}" `
             + `style="flex:none;color:var(--d2-gold-dim);font-size:13px;line-height:1;cursor:grab">⁙</span>`;
     }
-    html += `<span style="color:var(--d2-gold);font-family:'Cinzel',serif;font-size:13px">${arrow} ${esc(vt.label)}</span>`;
+    html += `<span style="color:var(--d2-gold);font-family:'Cinzel',serif;font-size:13px`
+          + (vt.pendingDelete ? ';text-decoration:line-through' : '')
+          + `">${arrow} ${esc(vt.label)}</span>`;
+    if (vt.pendingDelete) {
+      html += `<span style="font-size:8.5px;letter-spacing:1px;text-transform:uppercase;font-family:'Cinzel',serif;color:var(--d2-red-bright,#d06a6a);border:1px solid var(--d2-red,#8a2a2a);background:rgba(138,42,42,0.15);padding:2px 6px;border-radius:2px">${esc(L('ui_ss_chip_removing','Removing'))}</span>`;
+    }
     if (vt.kind === 'regular' && vt.isMod) {
       html += `<span style="font-size:8.5px;letter-spacing:1px;text-transform:uppercase;font-family:'Cinzel',serif;color:var(--d2-green-bright);border:1px solid var(--d2-green);background:rgba(42,90,42,0.15);padding:2px 6px;border-radius:2px">${esc(L('ui_ss_chip_mod','Mod'))}</span>`;
     }
@@ -18007,12 +18070,21 @@ function renderSharedStashTabs() {
     if (dnd) {
       // Insert borrows the last empty tab, so it needs one to exist and it
       // makes no sense on that tab itself (it is already an empty slot).
-      const canInsert = spareEmptyIdx >= 0 && spareEmptyIdx !== vt.physicalIdx;
-      const canDelete = vt.items.length === 0;
+      const canInsert = spareEmptyIdx >= 0 && spareEmptyIdx !== vt.physicalIdx && !vt.pendingDelete;
+      // ✕ doubles as the undo for both staged states, so it stays live on a
+      // tab already marked for removal or freshly inserted.
+      const canDelete = vt.items.length === 0 || vt.pendingDelete;
       const btnCss = (enabled) => `width:20px;height:20px;flex:none;display:flex;align-items:center;justify-content:center;`
         + `border:1px solid ${enabled ? 'var(--d2-gold-dim)' : 'var(--d2-border)'};border-radius:3px;background:transparent;`
         + `color:${enabled ? 'var(--d2-gold)' : 'var(--d2-text-dim)'};font-size:12px;line-height:1;padding:0;`
         + `cursor:${enabled ? 'pointer' : 'not-allowed'};opacity:${enabled ? '1' : '0.4'}`;
+      const delTitle = vt.pendingDelete
+        ? L('ui_ss_delete_empty_undo','Keep this tab after all')
+        : (vt.pendingAdd
+            ? L('ui_ss_insert_empty_undo','Take back this inserted tab')
+            : (canDelete
+                ? L('ui_ss_delete_empty_title','Remove this empty tab (it moves to the end)')
+                : L('ui_ss_delete_empty_disabled','Only an empty tab can be removed')));
       html += `<button type="button" ${canInsert ? '' : 'disabled '}`
             + `onclick="event.stopPropagation();ssInsertEmptyTabBefore(${vt.physicalIdx})" `
             + `title="${esc(canInsert
@@ -18021,10 +18093,8 @@ function renderSharedStashTabs() {
             + `style="${btnCss(canInsert)}">+</button>`;
       html += `<button type="button" ${canDelete ? '' : 'disabled '}`
             + `onclick="event.stopPropagation();ssDeleteEmptyTab(${vt.physicalIdx})" `
-            + `title="${esc(canDelete
-                ? L('ui_ss_delete_empty_title','Remove this empty tab (it moves to the end)')
-                : L('ui_ss_delete_empty_disabled','Only an empty tab can be removed'))}" `
-            + `style="${btnCss(canDelete)}">✕</button>`;
+            + `title="${esc(delTitle)}" `
+            + `style="${btnCss(canDelete)}">${vt.pendingDelete ? '↺' : '✕'}</button>`;
     }
     html += `</div>`;
     html += `</div>`;
@@ -18072,8 +18142,51 @@ function renderSharedStashTabs() {
   }
 
   container.innerHTML = html;
+  _ssRenderArrangeBar();
   _itemSearchHighlightOffset = null;
   hydrateItemSprites(container);
+}
+
+// Apply / Revert ride along in a floating bar rather than at the end of the
+// list: with a few hundred tabs, a bar in normal flow would be a long scroll
+// away from whichever tab the user just dragged.
+//
+// It lives on <body>, not inside the tab content, because .tab-content sets
+// its own z-index and so opens a stacking context — a position:fixed bar
+// rendered inside it is trapped there and the app footer paints over it.
+function _ssRenderArrangeBar() {
+  let bar = document.getElementById('ssArrangeBar');
+  if (!_ssSwapMode || !_ssDraftDirty()) { if (bar) bar.remove(); return; }
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'ssArrangeBar';
+    document.body.appendChild(bar);
+  }
+  // Sits clear of the app footer so Save / Undo stay clickable, and below the
+  // dialog layer (z-index 9999+) so confirmations still cover it.
+  bar.style.cssText = 'position:fixed;left:50%;bottom:88px;transform:translateX(-50%);z-index:9000;'
+    + 'display:flex;align-items:center;gap:14px;flex-wrap:wrap;justify-content:center;'
+    + 'padding:11px 16px;border:1px solid var(--d2-gold-dim);border-radius:4px;'
+    + 'background:var(--d2-grad-box-alt,var(--d2-surface2));box-shadow:0 6px 26px rgba(0,0,0,0.75)';
+
+  // Deliberately not "N tabs moved": inserting near the top shifts every tab
+  // behind it, so a slot-by-slot count reads as if the user made a hundred
+  // edits when they made one.
+  const removing = _ssDraft.deleted.size, adding = _ssDraft.added.size;
+  const parts = [];
+  if (_ssDraftReordered()) parts.push(L('ui_ss_pending_order', 'tab order changed'));
+  if (adding)   parts.push(Lfmt('ui_ss_pending_added',   '{n} inserted', { n: adding }));
+  if (removing) parts.push(Lfmt('ui_ss_pending_removed', '{n} to remove', { n: removing }));
+
+  bar.innerHTML =
+      `<div style="font-size:12.5px;line-height:1.45">`
+    + `<div style="color:var(--d2-gold);font-family:'Cinzel',serif">${esc(L('ui_ss_pending_title','Pending tab arrangement'))}</div>`
+    + `<div style="color:var(--d2-text-dim)">${esc(parts.join(' · '))}</div>`
+    + `</div>`
+    + `<div style="display:flex;gap:8px">`
+    + `<button type="button" class="btn" style="margin:0" onclick="ssRevertTabArrangement()">${esc(L('ui_ss_revert_btn','Revert'))}</button>`
+    + `<button type="button" class="btn btn-primary" style="margin:0" onclick="ssApplyTabArrangement()">${esc(L('ui_ss_apply_btn','Apply'))}</button>`
+    + `</div>`;
 }
 
 // ── Shared-stash search handlers ──
