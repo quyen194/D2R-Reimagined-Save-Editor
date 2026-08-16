@@ -16342,6 +16342,72 @@ function swapSharedStashTabs(idxA, idxB) {
   markSharedStashDirty();
 }
 
+// Relocates one regular tab's contents to another regular tab's position,
+// sliding every regular tab in between one slot along (a rotation, not a
+// swap). Used by the sort to pull a spare empty tab forward so the sorted
+// items land in a contiguous run.
+//
+// Same invariant as swapSharedStashTabs, and for the same reason: 64-byte
+// page headers never move, only the [count field + item payload] block does.
+// That keeps the global gold field pinned at bytes 12-15 inside the first
+// tab's header. Specialty (pageType != 0) tabs are excluded from the
+// rotation — they keep their own contents and act as fixed obstacles in the
+// physical layout, so tab numbering the user sees stays intact.
+function _ssMoveRegularTabContent(fromIdx, toIdx) {
+  if (!sharedStashParsed || !sharedStashData) return false;
+  const tabs = sharedStashParsed.tabs;
+  const regular = [];
+  for (let i = 0; i < tabs.length; i++) if (tabs[i].pageType === 0) regular.push(i);
+  const from = regular.indexOf(fromIdx), to = regular.indexOf(toIdx);
+  if (from < 0 || to < 0) return false;
+  if (from === to) return true;
+
+  const buf = sharedStashData;
+  const sectionStart = (i) => tabs[i].jmOff - 0x40;
+  const contentStart = (i) => tabs[i].jmOff + 2;                          // count field onwards
+  // Interior tabs run right up to the next section's header, which keeps any
+  // dead space they carry attached to them. The LAST tab must stop at its own
+  // stored length instead: a real file can carry further pages past the last
+  // JM-bearing one (Reimagined ships a trailing pageType=2 page with no "JM"
+  // marker at all, so the JM scan never sees it). Running to EOF there would
+  // splice that page into a tab's item payload.
+  const lastIdx = tabs.length - 1;
+  const contentEnd = (i) => (i < lastIdx) ? sectionStart(i + 1) : _ssPayloadEnd(lastIdx);
+  const trailer = buf.slice(contentEnd(lastIdx));   // pages the JM scan can't see
+
+  const content = tabs.map((_, i) => buf.slice(contentStart(i), contentEnd(i)));
+
+  // Shift the run between the two positions, then drop the moved tab in.
+  // Each step reads the neighbour it is about to overwrite, so a single
+  // forward/backward pass is enough.
+  const moved = content[fromIdx];
+  if (from < to) for (let p = from; p < to; p++) content[regular[p]] = content[regular[p + 1]];
+  else           for (let p = from; p > to; p--) content[regular[p]] = content[regular[p - 1]];
+  content[toIdx] = moved;
+
+  const chunks = [buf.slice(0, sectionStart(0))];
+  for (let i = 0; i < tabs.length; i++) {
+    chunks.push(buf.slice(sectionStart(i), contentStart(i)));  // 64-byte header + "JM"
+    chunks.push(content[i]);
+  }
+  chunks.push(trailer);
+  const out = _ssConcatU8(chunks);
+
+  // Every header stores its own section byte-length at +16 and the real
+  // client walks the page chain with it, so all of them get rewritten —
+  // several tabs changed size at once here, not just two.
+  let cursor = sectionStart(0);
+  for (let i = 0; i < tabs.length; i++) {
+    const len = 66 + content[i].length;   // 66 = 64-byte header + "JM"
+    writeU32LE(out, cursor + 16, len);
+    cursor += len;
+  }
+
+  sharedStashData = out;
+  parseSharedStash();
+  return true;
+}
+
 window.toggleSharedStashSwapMode = function() {
   _ssSwapMode = !_ssSwapMode;
   _ssSwapSelection = [];
@@ -16406,8 +16472,7 @@ window.confirmSharedStashSwapSelection = function() {
 //  SS_SORT_MODES below.
 // ═══════════════════════════════════════════════════════════
 let _ssSortState = null;
-// { step:0|1|2, modeId, sourceSel:Set<physicalIdx>, sourceFilter, targetFilter,
-//   targetOrder:[physicalIdx,...], pendingReason:null|{setGroup} }
+// { step:0|1, modeId, sourceSel:Set<physicalIdx>, sourceFilter }
 
 let _ssSetGroupMapCache = null;
 // setId (per-piece row index into setitems.txt) -> setGroup (the shared set
@@ -16743,7 +16808,6 @@ function _ssTabMatchesFilter(stats, filter) {
   switch (filter) {
     case 'onlyMatch': return stats.total > 0 && stats.match === stats.total;
     case 'hasMatch':  return stats.match > 0;
-    case 'empty':     return stats.total === 0;
     default:          return true; // 'all'
   }
 }
@@ -17089,6 +17153,10 @@ function _ssInsertItemsIntoTab(physicalIdx, entries) {
   parseSharedStash();
 }
 
+// Writes the plan's byte moves and nothing else. The dirty flag, the
+// re-render and the result popup belong to the caller: the in-place sort
+// still has tab moves to do after this returns, and has to be able to roll
+// everything back without ever having announced success.
 function _ssApplySortPlan(plan) {
   if (!sharedStashParsed || !sharedStashData) return;
 
@@ -17150,23 +17218,82 @@ function _ssApplySortPlan(plan) {
     _ssInsertItemsIntoTab(tIdx, entries);
   }
 
-  const itemTotal = plan.placements.reduce((s, p) => s + 1 + p.mi.children.length, 0);
+}
+
+// ── In-place sort: sorted items go back into the source tabs ─────────────
+//
+// The source tabs are the destination. When they can't hold everything, spare
+// empty tabs are borrowed from the far end of the stash — last empty tab
+// first — and each one is pulled forward to sit immediately behind the last
+// source tab, pushing every tab after it one slot along. Running out of spare
+// empty tabs is a hard failure that rolls the whole operation back.
+//
+// Planning is pure (_ssPlanSort touches no bytes), so the "how many extra
+// tabs do we need" search happens entirely before anything is written and the
+// no-room case fails without having changed a thing.
+function _ssPrepareInPlaceSort(mode, sourceIdxs) {
+  const sources = [...sourceIdxs].sort((a, b) => a - b);
+  if (!sources.length) return { error: 'noSource' };
+  const lastSource = sources[sources.length - 1];
+
+  // Only empty tabs BEHIND the last source tab are eligible: those are the
+  // ones that can be pulled forward without disturbing the source tabs' own
+  // positions. Last one first, matching "take the last empty tab".
+  const emptyPool = _ssRegularTabIndices()
+    .filter(i => i > lastSource && !sources.includes(i) && _ssTabStats(i, mode).total === 0)
+    .sort((a, b) => b - a);
+
+  let extras = [];
+  let plan = _ssPlanSort(sources, sources, mode);
+  while (!plan.ok && plan.needsTab && extras.length < emptyPool.length) {
+    extras = emptyPool.slice(0, extras.length + 1).sort((a, b) => a - b);
+    plan = _ssPlanSort(sources, [...sources, ...extras], mode);
+  }
+  if (plan.empty) return { error: 'empty' };
+  if (!plan.ok) return { error: 'noRoom', borrowed: extras.length };
+  return { plan, extras, sources, lastSource, mode };
+}
+
+function _ssApplyInPlaceSort(res) {
+  const backup = sharedStashData.slice();
+  const chainWasOk = _ssChainOkAtLoad;
+  try {
+    _ssApplySortPlan(res.plan);
+
+    // Pull each borrowed tab into place, in the order the plan filled them.
+    // Regular-tab positions are resolved once: a move only ever rotates the
+    // run below the tab it is moving, so the later borrowed tabs keep the
+    // physical indices they had when this list was built.
+    const regular = _ssRegularTabIndices();
+    const lastPos = regular.indexOf(res.lastSource);
+    res.extras.forEach((tabIdx, i) => {
+      const destIdx = regular[lastPos + 1 + i];
+      if (destIdx === undefined) throw new Error('no slot behind the last source tab for borrowed tab ' + tabIdx);
+      if (!_ssMoveRegularTabContent(tabIdx, destIdx)) throw new Error('tab move failed for ' + tabIdx);
+    });
+
+    // Structural check. A file that was already irregular when it loaded
+    // can't be held to this standard, so only a regression counts.
+    if (chainWasOk) {
+      const problem = validateSharedStashChain(sharedStashData) || validateSharedStashRecords();
+      if (problem) throw new Error(problem);
+    }
+  } catch (e) {
+    sharedStashData = backup;
+    parseSharedStash();
+    renderSharedStashTabs();
+    console.error('In-place sort rolled back:', e);
+    return { error: 'reverted', detail: e.message };
+  }
 
   markSharedStashDirty();
   renderSharedStashTabs();
-  if (plan.mode && plan.mode.atomicSets) {
-    const setTotal = new Set(plan.placements.map(p => p.mi.setGroup)).size;
-    showPopup(Lfmt('ui_ss_sort_done', 'Sorted {sets} set(s) ({items} item(s)) across {tabs} tab(s).',
-      { sets: setTotal, items: itemTotal, tabs: plan.targetOrder.length }));
-  } else {
-    showPopup(Lfmt('ui_ss_sort_done_generic', 'Sorted {items} item(s) across {tabs} tab(s).',
-      { items: itemTotal, tabs: plan.targetOrder.length }));
-  }
+  return { ok: true };
 }
 
 // ── Sort Items modal ──
-// Step 0 picks the sort mode, then the original two steps (source tabs →
-// target tabs) run unchanged against whichever mode was chosen.
+// Step 0 picks the sort mode, step 1 picks the tabs. There is no target step:
+// the source tabs are the destination — see _ssPrepareInPlaceSort.
 window.openSortItemsModal = function() {
   if (!sharedStashParsed) return;
   _ssSortState = {
@@ -17174,9 +17301,6 @@ window.openSortItemsModal = function() {
     modeId: SS_SORT_MODES[0].id,
     sourceSel: new Set(),
     sourceFilter: 'all',
-    targetFilter: 'all',
-    targetOrder: [],
-    pendingReason: null,
   };
   const modal = document.getElementById('ssSortModal');
   if (modal) modal.classList.add('visible');
@@ -17193,17 +17317,12 @@ window.ssSortPickMode = function(modeId) {
   _ssSortState.step = 1;
   _ssSortState.sourceSel = new Set();
   _ssSortState.sourceFilter = 'all';
-  _ssSortState.targetFilter = 'all';
-  _ssSortState.targetOrder = [];
-  _ssSortState.pendingReason = null;
   _renderSsSortModal();
 };
 
 window.ssSortBackToModeStep = function() {
   if (!_ssSortState) return;
   _ssSortState.step = 0;
-  _ssSortState.targetOrder = [];
-  _ssSortState.pendingReason = null;
   _renderSsSortModal();
 };
 
@@ -17216,12 +17335,6 @@ window.closeSsSortModal = function() {
 window.ssSortSetSourceFilter = function(f) {
   if (!_ssSortState) return;
   _ssSortState.sourceFilter = f;
-  _renderSsSortModal();
-};
-
-window.ssSortSetTargetFilter = function(f) {
-  if (!_ssSortState) return;
-  _ssSortState.targetFilter = f;
   _renderSsSortModal();
 };
 
@@ -17246,81 +17359,62 @@ window.ssSortSelectNoneSources = function() {
   _renderSsSortModal();
 };
 
-window.ssSortBackToSourceStep = function() {
-  if (!_ssSortState) return;
-  _ssSortState.step = 1;
-  _ssSortState.targetOrder = [];
-  _ssSortState.pendingReason = null;
-  _renderSsSortModal();
-};
+function _ssNoMatchMsg(mode) {
+  return Lfmt('ui_ss_sort_no_match', 'No {noun} found in the selected tabs.', { noun: mode.noun() });
+}
 
-window.ssSortGoToTargetStep = function() {
+window.ssSortRun = function() {
   if (!_ssSortState) return;
   const mode = _ssCurrentMode();
   if (!_ssSortState.sourceSel.size) { showPopup(L('ui_ss_sort_pick_source', 'Pick at least one source tab.')); return; }
+
   let anyMatch = false;
   for (const idx of _ssSortState.sourceSel) {
     if (_ssTabStats(idx, mode).match > 0) { anyMatch = true; break; }
   }
   if (!anyMatch) { showPopup(_ssNoMatchMsg(mode)); return; }
-  _ssSortState.step = 2;
-  _renderSsSortModal();
-};
 
-function _ssNoMatchMsg(mode) {
-  return Lfmt('ui_ss_sort_no_match', 'No {noun} found in the selected tabs.', { noun: mode.noun() });
-}
-
-window.ssSortPickTarget = function(idx) {
-  if (!_ssSortState) return;
-  if (_ssSortState.targetOrder.includes(idx)) return;
-  _ssSortState.targetOrder.push(idx);
-
-  const mode = _ssCurrentMode();
-  const sourceIdxs = [..._ssSortState.sourceSel];
-  const plan = _ssPlanSort(sourceIdxs, _ssSortState.targetOrder, mode);
-
-  if (plan.ok) {
-    _ssShowSortConfirm(plan);
+  const res = _ssPrepareInPlaceSort(mode, [..._ssSortState.sourceSel]);
+  if (res.error === 'empty' || res.error === 'noSource') { showPopup(_ssNoMatchMsg(mode)); return; }
+  if (res.error === 'noRoom') {
+    showPopup(Lfmt('ui_ss_sort_no_empty_tab',
+      'Not enough room: the selected tabs plus every spare empty tab behind them ({borrowed} used) still cannot hold everything. Nothing was changed.',
+      { borrowed: res.borrowed }));
     return;
   }
-  if (plan.needsTab) {
-    _ssSortState.pendingReason = { setGroup: plan.setGroup || '' };
-    _renderSsSortModal();
-    return;
-  }
-  showPopup(_ssNoMatchMsg(mode));
-  closeSsSortModal();
-};
 
-// Deselecting a target doesn't re-run planning — the old pendingReason no
-// longer reflects the current target list, so it's cleared and the user
-// picks again (via ssSortPickTarget) to trigger a fresh plan.
-window.ssSortRemoveTarget = function(idx) {
-  if (!_ssSortState) return;
-  _ssSortState.targetOrder = _ssSortState.targetOrder.filter(i => i !== idx);
-  _ssSortState.pendingReason = null;
-  _renderSsSortModal();
-};
-
-window.ssSortClearTargets = function() {
-  if (!_ssSortState) return;
-  _ssSortState.targetOrder = [];
-  _ssSortState.pendingReason = null;
-  _renderSsSortModal();
-};
-
-function _ssShowSortConfirm(plan) {
-  const itemTotal = plan.placements.reduce((s, p) => s + 1 + p.mi.children.length, 0);
-  const tabLabels = plan.targetOrder.map(i => _ssRegularTabLabel(i)).join(', ');
-  const msg = (plan.mode && plan.mode.atomicSets)
+  const itemTotal = res.plan.placements.reduce((s, p) => s + 1 + p.mi.children.length, 0);
+  const tabLabels = res.sources.map(i => _ssRegularTabLabel(i)).join(', ');
+  let msg = (res.plan.mode && res.plan.mode.atomicSets)
     ? Lfmt('ui_ss_sort_confirm_msg', 'Move {sets} set(s) ({items} item(s)) into: {tabs}?',
-        { sets: new Set(plan.placements.map(p => p.mi.setGroup)).size, items: itemTotal, tabs: tabLabels })
+        { sets: new Set(res.plan.placements.map(p => p.mi.setGroup)).size, items: itemTotal, tabs: tabLabels })
     : Lfmt('ui_ss_sort_confirm_msg_generic', 'Move {items} item(s) into: {tabs}?',
         { items: itemTotal, tabs: tabLabels });
+  if (res.extras.length) {
+    msg += ' ' + Lfmt('ui_ss_sort_confirm_borrow',
+      '{n} empty tab(s) will be pulled in behind {last}, shifting every later tab one place along.',
+      { n: res.extras.length, last: _ssRegularTabLabel(res.lastSource) });
+  }
+
   closeSsSortModal();
-  showConfirm(msg, () => { _ssApplySortPlan(plan); }, L('ui_ss_sort_confirm_btn', 'Sort'));
-}
+  showConfirm(msg, () => {
+    const applied = _ssApplyInPlaceSort(res);
+    if (applied.error === 'reverted') {
+      showPopup(Lfmt('ui_ss_sort_reverted',
+        'Sort failed and every change was rolled back — the stash is exactly as it was. ({detail})',
+        { detail: applied.detail }));
+      return;
+    }
+    const tabsUsed = res.sources.length + res.extras.length;
+    if (res.plan.mode && res.plan.mode.atomicSets) {
+      showPopup(Lfmt('ui_ss_sort_done', 'Sorted {sets} set(s) ({items} item(s)) across {tabs} tab(s).',
+        { sets: new Set(res.plan.placements.map(p => p.mi.setGroup)).size, items: itemTotal, tabs: tabsUsed }));
+    } else {
+      showPopup(Lfmt('ui_ss_sort_done_generic', 'Sorted {items} item(s) across {tabs} tab(s).',
+        { items: itemTotal, tabs: tabsUsed }));
+    }
+  }, L('ui_ss_sort_confirm_btn', 'Sort'));
+};
 
 function _renderSsSortModal() {
   const body = document.getElementById('ssSortModalBody');
@@ -17340,14 +17434,12 @@ function _renderSsSortModal() {
     : Lfmt('ui_ss_sort_tab_stats_generic', '{total} item(s) · {match} {noun}',
         { total: stats.total, match: stats.match, noun: mode.noun() });
 
-  const filterRow = (active, onClickFn, withEmpty) => {
-    let out = `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">`
+  const filterRow = (active, onClickFn) =>
+    `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">`
       + filterBtn('all', L('ui_ss_filter_all', 'All tabs'), active, onClickFn)
       + filterBtn('onlyMatch', Lfmt('ui_ss_filter_only_match', 'Only tabs holding nothing but {noun}', { noun: mode.noun() }), active, onClickFn)
-      + filterBtn('hasMatch', Lfmt('ui_ss_filter_has_match', 'Only tabs containing {noun}', { noun: mode.noun() }), active, onClickFn);
-    if (withEmpty) out += filterBtn('empty', L('ui_ss_filter_empty', 'Only empty tabs'), active, onClickFn);
-    return out + `</div>`;
-  };
+      + filterBtn('hasMatch', Lfmt('ui_ss_filter_has_match', 'Only tabs containing {noun}', { noun: mode.noun() }), active, onClickFn)
+    + `</div>`;
 
   if (st.step === 0) {
     html += `<div class="modal-title">${esc(L('ui_ss_sort_step0_title', 'Sort Items — Choose What to Sort'))}</div>`;
@@ -17365,11 +17457,11 @@ function _renderSsSortModal() {
     html += `<div class="modal-footer">`
           + `<button type="button" class="btn btn-primary" style="opacity:0.7" onclick="closeSsSortModal()">${esc(L('ui_cancel', 'Cancel'))}</button>`
           + `</div>`;
-  } else if (st.step === 1) {
-    html += `<div class="modal-title">${esc(Lfmt('ui_ss_sort_step1_title2', 'Sort {mode} — Choose Source Tabs', { mode: mode.label() }))}</div>`;
-    html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(Lfmt('ui_ss_sort_step1_hint2', 'Select which tabs to scan for {noun}.', { noun: mode.noun() }))}</div>`;
+  } else {
+    html += `<div class="modal-title">${esc(Lfmt('ui_ss_sort_step1_title3', 'Sort {mode} — Choose Tabs', { mode: mode.label() }))}</div>`;
+    html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(Lfmt('ui_ss_sort_step1_hint3', 'The {noun} in these tabs get sorted back into these same tabs. If they no longer fit, spare empty tabs are pulled in from the end of the stash, right behind the last tab you pick.', { noun: mode.noun() }))}</div>`;
 
-    html += filterRow(st.sourceFilter, 'ssSortSetSourceFilter', false);
+    html += filterRow(st.sourceFilter, 'ssSortSetSourceFilter');
 
     html += `<div style="display:flex;gap:8px;margin-bottom:10px">`
           + `<button type="button" class="btn" style="margin:0" onclick="ssSortSelectAllSources()">${esc(L('ui_ss_select_all', 'Select All'))}</button>`
@@ -17396,64 +17488,8 @@ function _renderSsSortModal() {
 
     html += `<div class="modal-footer">`
           + `<button type="button" class="btn" style="margin:0" onclick="ssSortBackToModeStep()">${esc(L('ui_back', 'Back'))}</button>`
-          + `<button type="button" class="btn btn-primary" onclick="ssSortGoToTargetStep()">${esc(L('ui_ss_sort_next', 'Next: Choose Target Tab'))}</button>`
+          + `<button type="button" class="btn btn-primary" onclick="ssSortRun()">${esc(L('ui_ss_sort_run', 'Sort These Tabs'))}</button>`
           + `<button type="button" class="btn btn-primary" style="opacity:0.7" onclick="closeSsSortModal()">${esc(L('ui_cancel', 'Cancel'))}</button>`
-          + `</div>`;
-  } else {
-    html += `<div class="modal-title">${esc(Lfmt('ui_ss_sort_step2_title2', 'Sort {mode} — Choose Target Tab', { mode: mode.label() }))}</div>`;
-
-    if (st.pendingReason) {
-      const msg = (mode.atomicSets && st.pendingReason.setGroup)
-        ? Lfmt('ui_ss_sort_need_more_tab', 'Not enough room for set "{set}" — pick another tab to continue.', { set: st.pendingReason.setGroup })
-        : L('ui_ss_sort_need_more_tab_generic', 'Not enough room — pick another tab to continue.');
-      html += `<div style="margin-bottom:12px;padding:10px 12px;border-left:3px solid var(--d2-gold);background:rgba(200,160,48,0.08);font-size:12px;color:var(--d2-text)">`
-            + esc(msg)
-            + `</div>`;
-    } else {
-      html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(Lfmt('ui_ss_sort_step2_hint2', 'Choose which tab the {noun} should be moved into.', { noun: mode.noun() }))}</div>`;
-    }
-
-    html += filterRow(st.targetFilter, 'ssSortSetTargetFilter', true);
-
-    if (st.targetOrder.length) {
-      html += `<div style="margin-bottom:10px">`
-            + `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">`
-            + `<span style="font-size:11.5px;color:var(--d2-text-dim)">${esc(L('ui_ss_sort_targets_used', 'Already chosen:'))}</span>`
-            + `<button type="button" class="btn" style="margin:0;padding:3px 9px;font-size:10px" onclick="ssSortClearTargets()">${esc(L('ui_ss_sort_clear_targets', 'Clear All'))}</button>`
-            + `</div>`;
-      html += `<div style="display:flex;flex-wrap:wrap;gap:6px">`;
-      for (const i of st.targetOrder) {
-        html += `<span style="display:flex;align-items:center;gap:6px;padding:4px 6px 4px 10px;background:rgba(200,168,75,0.10);border:1px solid var(--d2-gold-dim);border-radius:2px;font-size:11.5px;color:var(--d2-gold)">`
-              + esc(_ssRegularTabLabel(i))
-              + `<button type="button" onclick="ssSortRemoveTarget(${i})" title="${esc(L('ui_ss_sort_remove_target', 'Remove'))}" style="background:none;border:none;color:var(--d2-text-dim);cursor:pointer;font-size:13px;line-height:1;padding:0 2px">×</button>`
-              + `</span>`;
-      }
-      html += `</div></div>`;
-    }
-
-    const used = new Set(st.targetOrder);
-    const indices = _ssRegularTabIndices()
-      .filter(i => !used.has(i))
-      .filter(i => _ssTabMatchesFilter(_ssTabStats(i, mode), st.targetFilter));
-
-    html += `<div style="max-height:320px;overflow-y:auto;border:1px solid var(--d2-border);border-radius:2px;margin-bottom:14px">`;
-    if (!indices.length) {
-      html += `<div style="padding:14px;font-size:12px;color:var(--d2-text-dim);font-style:italic">${esc(L('ui_ss_sort_no_tabs', 'No tabs match this filter.'))}</div>`;
-    }
-    for (const idx of indices) {
-      const stats = _ssTabStats(idx, mode);
-      html += `<div onclick="ssSortPickTarget(${idx})" style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--d2-border)">`
-            + `<span style="font-family:'Cinzel',serif;font-size:13px;color:var(--d2-gold)">${esc(_ssRegularTabLabel(idx))}</span>`
-            + `<span style="font-size:11px;color:var(--d2-text-dim)">${esc(statsText(stats))}</span>`
-            + `</div>`;
-    }
-    html += `</div>`;
-
-    html += `<div class="modal-footer">`;
-    if (!st.pendingReason) {
-      html += `<button type="button" class="btn" style="margin:0" onclick="ssSortBackToSourceStep()">${esc(L('ui_back', 'Back'))}</button>`;
-    }
-    html += `<button type="button" class="btn btn-primary" style="opacity:0.7" onclick="closeSsSortModal()">${esc(L('ui_cancel', 'Cancel'))}</button>`
           + `</div>`;
   }
 
