@@ -415,6 +415,16 @@
     justify-content: center;
   }
   #itemModal.visible { display: flex; }
+  #ssSortModal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: rgba(0,0,0,0.75);
+    align-items: center;
+    justify-content: center;
+  }
+  #ssSortModal.visible { display: flex; }
   .modal-box {
     background: var(--d2-grad-box);
     border: 1px solid var(--d2-gold-dim);
@@ -15918,7 +15928,9 @@ function validateSharedStashChain(buf) {
 // inside a page is not. Records pack solid — a page's payload is exactly its
 // records back to back — so a page whose records don't tile its payload will
 // desync the client's sequential item decode even though every page header
-// still checks out.
+// still checks out. That is precisely the state that survived the page-chain
+// fix and kept the game bailing to character select: a page emptied by Sort
+// Set Items that still carried 168 bytes of a half-removed record.
 //
 // pageType=1 (specialty gem/rune page) is skipped — its AdvancedStashStackable
 // entries don't follow the parent/storage placement rules this relies on.
@@ -16246,7 +16258,8 @@ function parseSharedStash() {
     // an item and pushes a real one off the end of the cap — measured at 606 of
     // 1925 offsets wrong (31%) on a real 105-page stash. Every downstream byte
     // operation derives item length from the gap to the next offset, so a
-    // phantom silently truncates its neighbour.
+    // phantom silently truncates its neighbour; Sort Set Items then relocated
+    // half-records and the game refused to load the result.
     //
     // The reliable discriminator is placement, not position: a record that is
     // really sitting in a stash grid has parent=0 (top-level) and storage=5
@@ -16378,6 +16391,647 @@ window.confirmSharedStashSwapSelection = function() {
   );
 };
 
+// ═══════════════════════════════════════════════════════════
+//  SHARED STASH — SORT SET ITEMS
+//  Groups set items scattered across tabs by their parent set (e.g. every
+//  "Tal Rasha's Wrappings" piece, regardless of which tab it started in),
+//  sorts sets alphabetically, and repacks them into one or more tabs the
+//  user picks. Two phases: a pure in-memory simulation (_ssPlanSort) that
+//  can be re-run cheaply while the user picks tabs, then a byte-level apply
+//  (_ssApplySortPlan) that mutates sharedStashData once the plan is final.
+// ═══════════════════════════════════════════════════════════
+let _ssSortState = null;
+// { step:1|2, sourceSel:Set<physicalIdx>, sourceFilter, targetFilter,
+//   targetOrder:[physicalIdx,...], pendingReason:null|{setGroup} }
+
+let _ssSetGroupMapCache = null;
+// setId (per-piece row index into setitems.txt) -> setGroup (the shared set
+// name, e.g. both "Tal Rasha's Guardianship" and "...Fine-Spun Cloth" map to
+// "Tal Rasha's Wrappings"). Built from SET_CATALOG, which already resolves
+// this via setitems.txt's `set` column — see _buildSetItemCatalog.
+function _ssSetGroupMap() {
+  if (_ssSetGroupMapCache) return _ssSetGroupMapCache;
+  const map = {};
+  for (const entry of SET_CATALOG) {
+    if (entry.setId !== undefined && !(entry.setId in map)) map[entry.setId] = entry.setGroup || entry.setName;
+  }
+  _ssSetGroupMapCache = map;
+  return map;
+}
+
+function _ssRegularTabIndices() {
+  if (!sharedStashParsed) return [];
+  const out = [];
+  for (let i = 0; i < sharedStashParsed.tabs.length; i++) {
+    if (sharedStashParsed.tabs[i].pageType === 0) out.push(i);
+  }
+  return out;
+}
+
+// Same "count regular tabs up to and including this one" convention as
+// confirmSharedStashSwapSelection's labelFor — keeps tab numbering consistent
+// with what the main tab list already shows.
+function _ssRegularTabLabel(physicalIdx) {
+  let n = 0;
+  for (let t = 0; t <= physicalIdx; t++) {
+    if (sharedStashParsed.tabs[t].pageType !== 1) n++;
+  }
+  return `${L('ui_ss_tab_prefix', 'Tab')} ${n}`;
+}
+
+function _ssTabStats(physicalIdx) {
+  const tab = sharedStashParsed.tabs[physicalIdx];
+  const groupMap = _ssSetGroupMap();
+  let total = 0, setItems = 0;
+  const groupsSeen = new Set();
+  for (const it of tab.items) {
+    if (it.parent !== 0 || it.storage !== 5) continue; // top-level stash items only
+    total++;
+    ensureItemProps(it);
+    if (it.quality === 5) {
+      setItems++;
+      const sid = it.setId !== undefined ? it.setId : it.setItemId;
+      groupsSeen.add(groupMap[sid] || `Set #${sid}`);
+    }
+  }
+  return { total, setItems, setCount: groupsSeen.size };
+}
+
+function _ssTabMatchesFilter(stats, filter) {
+  switch (filter) {
+    case 'onlySet': return stats.total > 0 && stats.setItems === stats.total;
+    case 'hasSet':  return stats.setItems > 0;
+    case 'empty':   return stats.total === 0;
+    default:        return true; // 'all'
+  }
+}
+
+// Pure simulation — touches no bytes, only reads sharedStashParsed as it
+// currently stands. Safe to call repeatedly (e.g. once per target tab the
+// user picks) without side effects until the caller applies the result.
+function _ssPlanSort(sourceIdxs, targetOrder) {
+  const gridW = 16, gridH = 13; // same fixed size renderSharedStashTabs uses for every regular tab
+  const groupMap = _ssSetGroupMap();
+
+  const moveItems = [];
+  for (const tIdx of sourceIdxs) {
+    const tab = sharedStashParsed.tabs[tIdx];
+    for (const it of tab.items) {
+      if (it.parent !== 0 || it.storage !== 5) continue;
+      ensureItemProps(it);
+      if (it.quality !== 5) continue;
+      const setId = it.setId !== undefined ? it.setId : it.setItemId;
+      if (setId === undefined) continue;
+      const { w, h } = getItemSize(it.typeCode);
+      const children = findSocketedChildren(sharedStashData, tab.items, it);
+      const setGroup = groupMap[setId] || `Set #${setId}`;
+      moveItems.push({ item: it, tabIdx: tIdx, w, h, children, setId, setGroup });
+    }
+  }
+  if (!moveItems.length) return { ok: false, empty: true };
+
+  const moveItemOffsets = new Set(moveItems.map(mi => mi.item.byteOffset));
+
+  const groups = new Map(); // setGroup name -> mi[]
+  for (const mi of moveItems) {
+    if (!groups.has(mi.setGroup)) groups.set(mi.setGroup, []);
+    groups.get(mi.setGroup).push(mi);
+  }
+  const orderedGroups = [...groups.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0], undefined, { sensitivity: 'base' }));
+
+  // Occupancy = cells taken by items that are staying put (either not part of
+  // this move, or not set items at all). Items being moved free their old
+  // cells since they'll be repositioned by this same operation.
+  function buildOccupancy(tabIdx) {
+    const occ = new Set();
+    const tab = sharedStashParsed.tabs[tabIdx];
+    for (const it of tab.items) {
+      if (it.parent !== 0 || it.storage !== 5) continue;
+      if (moveItemOffsets.has(it.byteOffset)) continue;
+      const { w, h } = getItemSize(it.typeCode);
+      for (let dy = 0; dy < h; dy++) for (let dx = 0; dx < w; dx++) occ.add(`${it.x + dx},${it.y + dy}`);
+    }
+    return occ;
+  }
+  const occByTab = new Map(targetOrder.map(idx => [idx, buildOccupancy(idx)]));
+  const placements = [];
+
+  for (const [setGroup, items] of orderedGroups) {
+    // Phase 1: try to place the whole set atomically into one target tab.
+    let fitted = false;
+    for (const tIdx of targetOrder) {
+      const trial = new Set(occByTab.get(tIdx));
+      const tryPlacements = [];
+      let ok = true;
+      for (const mi of items) {
+        const pos = packItemIntoGrid(trial, gridW, gridH, mi.w, mi.h);
+        if (!pos) { ok = false; break; }
+        tryPlacements.push({ mi, destTabIdx: tIdx, x: pos.x, y: pos.y });
+      }
+      if (ok) {
+        occByTab.set(tIdx, trial);
+        placements.push(...tryPlacements);
+        fitted = true;
+        break;
+      }
+    }
+    if (fitted) continue;
+
+    // Phase 2: the set doesn't fit whole in any single target tab — only
+    // reachable for an oversized set. Spill across two consecutive target
+    // tabs instead of splitting it arbitrarily. Needs >=2 target tabs.
+    if (targetOrder.length < 2) {
+      return { ok: false, needsTab: true, setGroup };
+    }
+    let splitOk = false;
+    for (let i = 0; i < targetOrder.length - 1; i++) {
+      const tA = targetOrder[i], tB = targetOrder[i + 1];
+      const occA = new Set(occByTab.get(tA));
+      const occB = new Set(occByTab.get(tB));
+      const tryPlacements = [];
+      const leftover = [];
+      for (const mi of items) {
+        const pos = packItemIntoGrid(occA, gridW, gridH, mi.w, mi.h);
+        if (pos) tryPlacements.push({ mi, destTabIdx: tA, x: pos.x, y: pos.y });
+        else leftover.push(mi);
+      }
+      let stillOk = true;
+      for (const mi of leftover) {
+        const pos = packItemIntoGrid(occB, gridW, gridH, mi.w, mi.h);
+        if (pos) tryPlacements.push({ mi, destTabIdx: tB, x: pos.x, y: pos.y });
+        else { stillOk = false; break; }
+      }
+      if (stillOk) {
+        occByTab.set(tA, occA); occByTab.set(tB, occB);
+        placements.push(...tryPlacements);
+        splitOk = true;
+        break;
+      }
+    }
+    if (!splitOk) {
+      return { ok: false, needsTab: true, setGroup };
+    }
+  }
+
+  return { ok: true, placements, targetOrder: targetOrder.slice() };
+}
+
+function _ssConcatU8(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+
+// Cuts a batch of item byte-ranges (each already spanning parent + its
+// socketed children) out of one shared-stash tab's payload in a single
+// splice, then fixes up that tab's JM item-count field and its own 64-byte
+// header's section-length field — see swapSharedStashTabs for why the
+// latter matters even though this app's own parser re-derives everything by
+// re-scanning for JM markers: the real client trusts the stored length.
+function _ssRemoveItemsFromTab(physicalIdx, ranges) {
+  const tab = sharedStashParsed.tabs[physicalIdx];
+  const jmOff = tab.jmOff;
+  const sectionStart = jmOff - 0x40;
+  const itemsStart = jmOff + 4;
+  // Never past this section's own last byte — see parseSharedStash's
+  // sectionEnd note. A range that ran over would splice out the FRONT of the
+  // next section's 64-byte header (its 0x55AA55AA magic) and subtract those
+  // bytes from THIS section's length field, breaking the client's
+  // walk-by-length chain even though every JM marker still looks fine.
+  const payloadEnd = _ssPayloadEnd(physicalIdx);
+
+  const sorted = ranges.slice().sort((a, b) => a.start - b.start);
+  const keep = [];
+  let cursor = itemsStart;
+  let removedBytes = 0, removedCount = 0;
+  for (const r of sorted) {
+    // Hard clamp: a decoder-derived length can overshoot the record's real
+    // extent, so the section boundary is the final authority.
+    const rStart = Math.max(itemsStart, Math.min(r.start, payloadEnd));
+    const rEnd = Math.min(r.start + r.len, payloadEnd);
+    if (rEnd <= rStart) { removedCount += r.count; continue; }
+    if (rStart > cursor) keep.push(sharedStashData.slice(cursor, rStart));
+    removedBytes += rEnd - rStart;
+    removedCount += r.count;
+    cursor = rEnd;
+  }
+  if (cursor < payloadEnd) keep.push(sharedStashData.slice(cursor, payloadEnd));
+  const newPayload = _ssConcatU8(keep);
+
+  const pre  = sharedStashData.slice(0, itemsStart);
+  const post = sharedStashData.slice(payloadEnd);
+  const out  = _ssConcatU8([pre, newPayload, post]);
+
+  const newCount = tab.count - removedCount;
+  out[jmOff + 2] = newCount & 0xff;
+  out[jmOff + 3] = (newCount >> 8) & 0xff;
+
+  const oldLen = readU32LE(out, sectionStart + 16);
+  writeU32LE(out, sectionStart + 16, oldLen - removedBytes);
+
+  sharedStashData = out;
+  parseSharedStash();
+}
+
+// Byte length of one item record, for OUR OWN extraction/reinsertion math.
+//
+// Records pack solid: a page's payload is exactly its records back to back,
+// with no padding anywhere. Two measurements on a real 105-page stash pin this
+// down — every one of its 62 empty pages has a payload of exactly 0 bytes, and
+// the span from each page's last record to its sectionEnd (min 38 / median 56 /
+// max 81) sits squarely inside the distribution of interior record sizes (min
+// 33 / median 57 / max 129), i.e. the tail is one ordinary item, not an item
+// plus slack.
+//
+// So both cases are exact arithmetic and neither needs the bit decoder:
+//   interior record -> distance to the next record
+//   last record     -> distance to sectionEnd
+//
+// This deliberately no longer consults decodeItemProperties().endBit. That
+// value agrees with the real record boundary only ~16% of the time on this
+// data (its property-list walk desyncs on 84% of items), and it was the reason
+// a relocated last-item record used to be cut short or run into the next page's
+// header. Correct boundaries now come from parseSharedStash's placement filter
+// — see _selectStashRecords.
+function _ssItemTrueLength(buf, item, tabItems, sectionEnd) {
+  const nextOffsets = tabItems.map(it => it.byteOffset).filter(o => o > item.byteOffset);
+  if (nextOffsets.length) {
+    const len = Math.min(...nextOffsets) - item.byteOffset;
+    return len > 0 ? len : 0;
+  }
+  if (typeof sectionEnd !== 'number' || sectionEnd <= item.byteOffset) return 0;
+  const len = sectionEnd - item.byteOffset;
+  // Plausibility guard for files this app did not write (or pages another tool
+  // left padding in): no real D2 item record comes close to this size, so an
+  // oversized tail means the "no padding" invariant does not hold here and the
+  // caller should not treat the whole tail as one item.
+  if (len > 512) {
+    console.warn(`_ssItemTrueLength: page tail at 0x${item.byteOffset.toString(16)} is ${len} bytes `
+      + `— too large to be a single record; refusing to guess`);
+    return 0;
+  }
+  return len;
+}
+
+// End of a tab's item payload — i.e. the last byte that belongs to this
+// section, never the next section's header. See parseSharedStash's sectionEnd
+// note for why this is 0x40 short of the next JM marker.
+function _ssPayloadEnd(physicalIdx) {
+  const tab = sharedStashParsed.tabs[physicalIdx];
+  if (tab && typeof tab.sectionEnd === 'number') return tab.sectionEnd;
+  const next = sharedStashParsed.tabs[physicalIdx + 1];
+  return next ? next.jmOff - 0x40 : sharedStashData.length;
+}
+
+// Appends already position-patched item blobs to a shared-stash tab's
+// payload (mirror image of _ssRemoveItemsFromTab). Inserts right after the
+// tab's current last real item rather than at the section's raw end, so any
+// trailing dead space stays after our new items instead of getting
+// sandwiched between old and new records — see _ssItemTrueLength.
+function _ssInsertItemsIntoTab(physicalIdx, entries) {
+  const tab = sharedStashParsed.tabs[physicalIdx];
+  const jmOff = tab.jmOff;
+  const sectionStart = jmOff - 0x40;
+  const itemsStart = jmOff + 4;
+  const payloadEnd = _ssPayloadEnd(physicalIdx);
+
+  let liveEnd = itemsStart;
+  if (tab.items.length) {
+    const lastItem = tab.items[tab.items.length - 1];
+    const lastLen = _ssItemTrueLength(sharedStashData, lastItem, tab.items, payloadEnd);
+    liveEnd = lastItem.byteOffset + (lastLen || (payloadEnd - lastItem.byteOffset));
+  }
+  // Inserting past this section's own end would drop the new records inside
+  // the NEXT section's 64-byte header while crediting their bytes to this
+  // section's length field — a corrupt chain the client refuses to load.
+  liveEnd = Math.max(itemsStart, Math.min(liveEnd, payloadEnd));
+
+  const insertion = _ssConcatU8(entries.map(e => e.bytes));
+  const addedCount = entries.reduce((s, e) => s + e.count, 0);
+
+  const pre  = sharedStashData.slice(0, liveEnd);
+  const post = sharedStashData.slice(liveEnd); // trailing dead space (if any) + everything after this tab
+  const out  = _ssConcatU8([pre, insertion, post]);
+
+  const newCount = tab.count + addedCount;
+  out[jmOff + 2] = newCount & 0xff;
+  out[jmOff + 3] = (newCount >> 8) & 0xff;
+
+  const oldLen = readU32LE(out, sectionStart + 16);
+  writeU32LE(out, sectionStart + 16, oldLen + insertion.length);
+
+  sharedStashData = out;
+  parseSharedStash();
+}
+
+function _ssApplySortPlan(plan) {
+  if (!sharedStashParsed || !sharedStashData) return;
+
+  // Step 1 — extract raw bytes for every item (+ its socketed children)
+  // before any mutation, while every captured byteOffset is still valid.
+  // Uses _ssItemTrueLength (not _structuralItemLength) so an item that
+  // happens to be the last one in its tab doesn't get its extracted span
+  // padded with trailing dead space — see _ssItemTrueLength for why.
+  const extracted = new Map(); // placement -> { bytes, recordCount }
+  for (const p of plan.placements) {
+    const mi = p.mi;
+    const tab = sharedStashParsed.tabs[mi.tabIdx];
+    const sectionEnd = _ssPayloadEnd(mi.tabIdx);
+    const parentLen = _ssItemTrueLength(sharedStashData, mi.item, tab.items, sectionEnd)
+      || _structuralItemLength(sharedStashData, mi.item, tab.items, sectionEnd);
+    let totalLen = parentLen;
+    if (mi.children.length) {
+      const lastChild = mi.children[mi.children.length - 1];
+      const lastChildLen = _ssItemTrueLength(sharedStashData, lastChild, tab.items, sectionEnd)
+        || _structuralItemLength(sharedStashData, lastChild, tab.items, sectionEnd);
+      totalLen = (lastChild.byteOffset + lastChildLen) - mi.item.byteOffset;
+    }
+    // _structuralItemLength MAXes in a scanner fallback that runs to the
+    // boundary it was handed, so the span still has to be capped here.
+    totalLen = Math.min(totalLen, sectionEnd - mi.item.byteOffset);
+    const bytes = sharedStashData.slice(mi.item.byteOffset, mi.item.byteOffset + totalLen);
+    extracted.set(p, { bytes, recordCount: 1 + mi.children.length });
+  }
+
+  // Step 2 — remove from source tabs, highest physical index first. Removing
+  // bytes from a later tab never shifts an earlier tab's absolute offsets,
+  // so every removal always sees byteOffsets that are still valid.
+  const bySourceTab = new Map();
+  for (const p of plan.placements) {
+    const mi = p.mi;
+    const ex = extracted.get(p);
+    if (!bySourceTab.has(mi.tabIdx)) bySourceTab.set(mi.tabIdx, []);
+    bySourceTab.get(mi.tabIdx).push({ start: mi.item.byteOffset, len: ex.bytes.length, count: ex.recordCount });
+  }
+  const sourceTabIdxs = [...bySourceTab.keys()].sort((a, b) => b - a);
+  for (const tIdx of sourceTabIdxs) {
+    _ssRemoveItemsFromTab(tIdx, bySourceTab.get(tIdx));
+  }
+
+  // Step 3 — patch each parent's grid position onto its extracted blob (bit
+  // offsets 35/42/46/50 all fall inside the parent's own header bytes, so
+  // the untouched child bytes right after it are unaffected), then insert
+  // into the destination tab. Insertion always re-reads the destination
+  // tab's current jmOff from the just-refreshed parse, so it's unaffected by
+  // whatever removals happened above.
+  const byDestTab = new Map();
+  for (const p of plan.placements) {
+    const ex = extracted.get(p);
+    const patched = _patchItemPosition(ex.bytes, p.x, p.y, 5, 0); // storage=5 stash, parent=0 top-level
+    if (!byDestTab.has(p.destTabIdx)) byDestTab.set(p.destTabIdx, []);
+    byDestTab.get(p.destTabIdx).push({ bytes: patched, count: ex.recordCount });
+  }
+  for (const [tIdx, entries] of byDestTab) {
+    _ssInsertItemsIntoTab(tIdx, entries);
+  }
+
+  const itemTotal = plan.placements.reduce((s, p) => s + 1 + p.mi.children.length, 0);
+  const setTotal = new Set(plan.placements.map(p => p.mi.setGroup)).size;
+
+  markSharedStashDirty();
+  renderSharedStashTabs();
+  showPopup(Lfmt('ui_ss_sort_done', 'Sorted {sets} set(s) ({items} item(s)) across {tabs} tab(s).',
+    { sets: setTotal, items: itemTotal, tabs: plan.targetOrder.length }));
+}
+
+// ── Sort Set Items modal ──
+window.openSortSetItemsModal = function() {
+  if (!sharedStashParsed) return;
+  _ssSortState = {
+    step: 1,
+    sourceSel: new Set(),
+    sourceFilter: 'all',
+    targetFilter: 'all',
+    targetOrder: [],
+    pendingReason: null,
+  };
+  const modal = document.getElementById('ssSortModal');
+  if (modal) modal.classList.add('visible');
+  _renderSsSortModal();
+};
+
+window.closeSsSortModal = function() {
+  const modal = document.getElementById('ssSortModal');
+  if (modal) modal.classList.remove('visible');
+  _ssSortState = null;
+};
+
+window.ssSortSetSourceFilter = function(f) {
+  if (!_ssSortState) return;
+  _ssSortState.sourceFilter = f;
+  _renderSsSortModal();
+};
+
+window.ssSortSetTargetFilter = function(f) {
+  if (!_ssSortState) return;
+  _ssSortState.targetFilter = f;
+  _renderSsSortModal();
+};
+
+window.ssSortToggleSource = function(idx) {
+  if (!_ssSortState) return;
+  if (_ssSortState.sourceSel.has(idx)) _ssSortState.sourceSel.delete(idx);
+  else _ssSortState.sourceSel.add(idx);
+  _renderSsSortModal();
+};
+
+window.ssSortSelectAllSources = function() {
+  if (!_ssSortState) return;
+  const indices = _ssRegularTabIndices().filter(i => _ssTabMatchesFilter(_ssTabStats(i), _ssSortState.sourceFilter));
+  for (const i of indices) _ssSortState.sourceSel.add(i);
+  _renderSsSortModal();
+};
+
+window.ssSortSelectNoneSources = function() {
+  if (!_ssSortState) return;
+  _ssSortState.sourceSel.clear();
+  _renderSsSortModal();
+};
+
+window.ssSortBackToSourceStep = function() {
+  if (!_ssSortState) return;
+  _ssSortState.step = 1;
+  _ssSortState.targetOrder = [];
+  _ssSortState.pendingReason = null;
+  _renderSsSortModal();
+};
+
+window.ssSortGoToTargetStep = function() {
+  if (!_ssSortState) return;
+  if (!_ssSortState.sourceSel.size) { showPopup(L('ui_ss_sort_pick_source', 'Pick at least one source tab.')); return; }
+  let anySet = false;
+  for (const idx of _ssSortState.sourceSel) {
+    if (_ssTabStats(idx).setItems > 0) { anySet = true; break; }
+  }
+  if (!anySet) { showPopup(L('ui_ss_sort_no_set_items', 'No set items found in the selected tabs.')); return; }
+  _ssSortState.step = 2;
+  _renderSsSortModal();
+};
+
+window.ssSortPickTarget = function(idx) {
+  if (!_ssSortState) return;
+  if (_ssSortState.targetOrder.includes(idx)) return;
+  _ssSortState.targetOrder.push(idx);
+
+  const sourceIdxs = [..._ssSortState.sourceSel];
+  const plan = _ssPlanSort(sourceIdxs, _ssSortState.targetOrder);
+
+  if (plan.ok) {
+    _ssShowSortConfirm(plan);
+    return;
+  }
+  if (plan.needsTab) {
+    _ssSortState.pendingReason = { setGroup: plan.setGroup };
+    _renderSsSortModal();
+    return;
+  }
+  showPopup(L('ui_ss_sort_no_set_items', 'No set items found in the selected tabs.'));
+  closeSsSortModal();
+};
+
+// Deselecting a target doesn't re-run planning — the old pendingReason no
+// longer reflects the current target list, so it's cleared and the user
+// picks again (via ssSortPickTarget) to trigger a fresh plan.
+window.ssSortRemoveTarget = function(idx) {
+  if (!_ssSortState) return;
+  _ssSortState.targetOrder = _ssSortState.targetOrder.filter(i => i !== idx);
+  _ssSortState.pendingReason = null;
+  _renderSsSortModal();
+};
+
+window.ssSortClearTargets = function() {
+  if (!_ssSortState) return;
+  _ssSortState.targetOrder = [];
+  _ssSortState.pendingReason = null;
+  _renderSsSortModal();
+};
+
+function _ssShowSortConfirm(plan) {
+  const setTotal = new Set(plan.placements.map(p => p.mi.setGroup)).size;
+  const itemTotal = plan.placements.reduce((s, p) => s + 1 + p.mi.children.length, 0);
+  const tabLabels = plan.targetOrder.map(i => _ssRegularTabLabel(i)).join(', ');
+  closeSsSortModal();
+  showConfirm(
+    Lfmt('ui_ss_sort_confirm_msg', 'Move {sets} set(s) ({items} item(s)) into: {tabs}?',
+      { sets: setTotal, items: itemTotal, tabs: tabLabels }),
+    () => { _ssApplySortPlan(plan); },
+    L('ui_ss_sort_confirm_btn', 'Sort')
+  );
+}
+
+function _renderSsSortModal() {
+  const body = document.getElementById('ssSortModalBody');
+  const st = _ssSortState;
+  if (!body || !st) return;
+  let html = '';
+
+  const filterBtn = (key, label, active, onClickFn) =>
+    `<button type="button" class="modal-sort-btn${active === key ? ' active' : ''}" onclick="${onClickFn}('${key}')">${esc(label)}</button>`;
+
+  if (st.step === 1) {
+    html += `<div class="modal-title">${esc(L('ui_ss_sort_step1_title', 'Sort Set Items — Choose Source Tabs'))}</div>`;
+    html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(L('ui_ss_sort_step1_hint', 'Select which tabs to scan for set items.'))}</div>`;
+
+    html += `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">`
+          + filterBtn('all', L('ui_ss_filter_all', 'All tabs'), st.sourceFilter, 'ssSortSetSourceFilter')
+          + filterBtn('onlySet', L('ui_ss_filter_only_set', 'Only tabs with only set items'), st.sourceFilter, 'ssSortSetSourceFilter')
+          + filterBtn('hasSet', L('ui_ss_filter_has_set', 'Only tabs with ≥1 set item'), st.sourceFilter, 'ssSortSetSourceFilter')
+          + `</div>`;
+
+    html += `<div style="display:flex;gap:8px;margin-bottom:10px">`
+          + `<button type="button" class="btn" style="margin:0" onclick="ssSortSelectAllSources()">${esc(L('ui_ss_select_all', 'Select All'))}</button>`
+          + `<button type="button" class="btn" style="margin:0" onclick="ssSortSelectNoneSources()">${esc(L('ui_ss_select_none', 'Select None'))}</button>`
+          + `</div>`;
+
+    const indices = _ssRegularTabIndices().filter(i => _ssTabMatchesFilter(_ssTabStats(i), st.sourceFilter));
+    html += `<div style="max-height:340px;overflow-y:auto;border:1px solid var(--d2-border);border-radius:2px;margin-bottom:14px">`;
+    if (!indices.length) {
+      html += `<div style="padding:14px;font-size:12px;color:var(--d2-text-dim);font-style:italic">${esc(L('ui_ss_sort_no_tabs', 'No tabs match this filter.'))}</div>`;
+    }
+    for (const idx of indices) {
+      const stats = _ssTabStats(idx);
+      const checked = st.sourceSel.has(idx);
+      html += `<div onclick="ssSortToggleSource(${idx})" style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--d2-border);background:${checked ? 'rgba(200,168,75,0.10)' : 'transparent'}">`
+            + `<div style="display:flex;align-items:center;gap:10px">`
+            + `<input type="checkbox" ${checked ? 'checked' : ''} style="accent-color:var(--d2-gold);pointer-events:none">`
+            + `<span style="font-family:'Cinzel',serif;font-size:13px;color:var(--d2-gold)">${esc(_ssRegularTabLabel(idx))}</span>`
+            + `</div>`
+            + `<div style="font-size:11px;color:var(--d2-text-dim)">${esc(Lfmt('ui_ss_sort_tab_stats', '{total} item(s) · {setItems} set item(s) · {setCount} set(s)', stats))}</div>`
+            + `</div>`;
+    }
+    html += `</div>`;
+
+    html += `<div class="modal-footer">`
+          + `<button type="button" class="btn btn-primary" onclick="ssSortGoToTargetStep()">${esc(L('ui_ss_sort_next', 'Next: Choose Target Tab'))}</button>`
+          + `<button type="button" class="btn btn-primary" style="opacity:0.7" onclick="closeSsSortModal()">${esc(L('ui_cancel', 'Cancel'))}</button>`
+          + `</div>`;
+  } else {
+    html += `<div class="modal-title">${esc(L('ui_ss_sort_step2_title', 'Sort Set Items — Choose Target Tab'))}</div>`;
+
+    if (st.pendingReason) {
+      html += `<div style="margin-bottom:12px;padding:10px 12px;border-left:3px solid var(--d2-gold);background:rgba(200,160,48,0.08);font-size:12px;color:var(--d2-text)">`
+            + esc(Lfmt('ui_ss_sort_need_more_tab', 'Not enough room for set "{set}" — pick another tab to continue.', { set: st.pendingReason.setGroup }))
+            + `</div>`;
+    } else {
+      html += `<div style="font-size:12px;color:var(--d2-text-dim);margin-bottom:12px">${esc(L('ui_ss_sort_step2_hint', 'Choose which tab set items should be moved into.'))}</div>`;
+    }
+
+    html += `<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">`
+          + filterBtn('all', L('ui_ss_filter_all', 'All tabs'), st.targetFilter, 'ssSortSetTargetFilter')
+          + filterBtn('onlySet', L('ui_ss_filter_only_set', 'Only tabs with only set items'), st.targetFilter, 'ssSortSetTargetFilter')
+          + filterBtn('hasSet', L('ui_ss_filter_has_set', 'Only tabs with ≥1 set item'), st.targetFilter, 'ssSortSetTargetFilter')
+          + filterBtn('empty', L('ui_ss_filter_empty', 'Only empty tabs'), st.targetFilter, 'ssSortSetTargetFilter')
+          + `</div>`;
+
+    if (st.targetOrder.length) {
+      html += `<div style="margin-bottom:10px">`
+            + `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">`
+            + `<span style="font-size:11.5px;color:var(--d2-text-dim)">${esc(L('ui_ss_sort_targets_used', 'Already chosen:'))}</span>`
+            + `<button type="button" class="btn" style="margin:0;padding:3px 9px;font-size:10px" onclick="ssSortClearTargets()">${esc(L('ui_ss_sort_clear_targets', 'Clear All'))}</button>`
+            + `</div>`;
+      html += `<div style="display:flex;flex-wrap:wrap;gap:6px">`;
+      for (const i of st.targetOrder) {
+        html += `<span style="display:flex;align-items:center;gap:6px;padding:4px 6px 4px 10px;background:rgba(200,168,75,0.10);border:1px solid var(--d2-gold-dim);border-radius:2px;font-size:11.5px;color:var(--d2-gold)">`
+              + esc(_ssRegularTabLabel(i))
+              + `<button type="button" onclick="ssSortRemoveTarget(${i})" title="${esc(L('ui_ss_sort_remove_target', 'Remove'))}" style="background:none;border:none;color:var(--d2-text-dim);cursor:pointer;font-size:13px;line-height:1;padding:0 2px">×</button>`
+              + `</span>`;
+      }
+      html += `</div></div>`;
+    }
+
+    const used = new Set(st.targetOrder);
+    const indices = _ssRegularTabIndices()
+      .filter(i => !used.has(i))
+      .filter(i => _ssTabMatchesFilter(_ssTabStats(i), st.targetFilter));
+
+    html += `<div style="max-height:320px;overflow-y:auto;border:1px solid var(--d2-border);border-radius:2px;margin-bottom:14px">`;
+    if (!indices.length) {
+      html += `<div style="padding:14px;font-size:12px;color:var(--d2-text-dim);font-style:italic">${esc(L('ui_ss_sort_no_tabs', 'No tabs match this filter.'))}</div>`;
+    }
+    for (const idx of indices) {
+      const stats = _ssTabStats(idx);
+      html += `<div onclick="ssSortPickTarget(${idx})" style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--d2-border)">`
+            + `<span style="font-family:'Cinzel',serif;font-size:13px;color:var(--d2-gold)">${esc(_ssRegularTabLabel(idx))}</span>`
+            + `<span style="font-size:11px;color:var(--d2-text-dim)">${esc(Lfmt('ui_ss_sort_tab_stats', '{total} item(s) · {setItems} set item(s) · {setCount} set(s)', stats))}</span>`
+            + `</div>`;
+    }
+    html += `</div>`;
+
+    html += `<div class="modal-footer">`;
+    if (!st.pendingReason) {
+      html += `<button type="button" class="btn" style="margin:0" onclick="ssSortBackToSourceStep()">${esc(L('ui_back', 'Back'))}</button>`;
+    }
+    html += `<button type="button" class="btn btn-primary" style="opacity:0.7" onclick="closeSsSortModal()">${esc(L('ui_cancel', 'Cancel'))}</button>`
+          + `</div>`;
+  }
+
+  body.innerHTML = html;
+}
+
 window.toggleSharedStashTab = function(tabId) {
   sharedStashOpenTab = (sharedStashOpenTab === tabId) ? '' : tabId;
   renderSharedStashTabs();
@@ -16459,6 +17113,7 @@ function renderSharedStashTabs() {
   html += `<button type="button" class="btn ${_ssSwapMode ? 'btn-primary' : ''}" style="margin:0" onclick="toggleSharedStashSwapMode()">`
         + (_ssSwapMode ? esc(L('ui_ss_swap_mode_on', 'Swapping Tabs')) : esc(L('ui_ss_swap_mode_off', 'Swap Tab Contents')))
         + `</button>`;
+  html += `<button type="button" class="btn" style="margin:0" onclick="openSortSetItemsModal()">${esc(L('ui_ss_sort_btn', 'Sort Set Items'))}</button>`;
   html += `</div>`;
   if (_ssSwapMode) {
     html += `<div style="color:var(--d2-text-dim);font-size:11.5px;margin-bottom:10px;font-style:italic">`
@@ -20949,6 +21604,13 @@ window.addEventListener('DOMContentLoaded', startBaseFileLoad);
       <button class="btn btn-primary" id="modalInsertBtn" onclick="confirmInsertItem()" style="display:none">Insert Item</button>
       <button class="btn btn-primary" id="modalCancelBtn" onclick="closeItemModal()" style="opacity:0.7">Cancel</button>
     </div>
+  </div>
+</div>
+
+<!-- Shared Stash: Sort Set Items modal -->
+<div id="ssSortModal" onclick="if(event.target===this)closeSsSortModal()">
+  <div class="modal-box" style="width:600px">
+    <div id="ssSortModalBody"></div>
   </div>
 </div>
 
