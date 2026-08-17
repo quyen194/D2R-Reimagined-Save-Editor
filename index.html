@@ -17586,12 +17586,20 @@ function _ssPrepareInPlaceSort(mode, sourceIdxs, destIdxs) {
   if (!plan.ok) {
     return { error: plan.needsStrayTab ? 'noStrayTab' : 'noRoom', borrowed: nSort + nStray };
   }
-  return { plan, extras: parts.extras, strayTabs: parts.strayTabs, sources, dests, lastDest, mode };
+  return { plan, extras: parts.extras, sortExtras: parts.sortExtras, strayTabs: parts.strayTabs,
+           sources, dests, lastDest, mode };
 }
 
-function _ssApplyInPlaceSort(res) {
+// opts.keepStraysAtEnd — leave the borrowed stray tabs at the far end of the
+// stash instead of pulling them forward with the overflow tabs. The manual
+// sort wants everything it touched in one contiguous run behind the targets;
+// the auto sort must not let a stray tab wedge itself into the middle of a
+// fixed slot range, so it opts out. Strays are placed by physical tab index,
+// which is unaffected either way.
+function _ssApplyInPlaceSort(res, opts) {
   const backup = sharedStashData.slice();
   const chainWasOk = _ssChainOkAtLoad;
+  const toMove = (opts && opts.keepStraysAtEnd) ? (res.sortExtras || res.extras) : res.extras;
   try {
     _ssApplySortPlan(res.plan);
 
@@ -17601,7 +17609,7 @@ function _ssApplyInPlaceSort(res) {
     // physical indices they had when this list was built.
     const regular = _ssRegularTabIndices();
     const lastPos = regular.indexOf(res.lastDest);
-    res.extras.forEach((tabIdx, i) => {
+    toMove.forEach((tabIdx, i) => {
       const slotIdx = regular[lastPos + 1 + i];
       if (slotIdx === undefined) throw new Error('no slot behind the last target tab for borrowed tab ' + tabIdx);
       if (!_ssMoveRegularTabContent(tabIdx, slotIdx)) throw new Error('tab move failed for ' + tabIdx);
@@ -17625,6 +17633,210 @@ function _ssApplyInPlaceSort(res) {
   renderSharedStashTabs();
   return { ok: true };
 }
+
+// ═══════════════════════════════════════════════════════════
+//  SHARED STASH — AUTO SORT
+//  One click, one fixed stash layout. Adds no sorting logic of its own: it
+//  runs the existing per-category sorts back to back, each one aimed at a
+//  reserved run of tab slots, and lets the borrow machinery in
+//  _ssPrepareInPlaceSort handle overflow.
+//
+//  A category that needs more than its reserved run borrows empty tabs, which
+//  are pulled in right behind its last target — so every later category simply
+//  starts further along. A category with too few items leaves the tail of its
+//  run empty, which is the padding the layout asks for.
+//
+//  Each step commits (or rolls itself back) on its own — there is no
+//  all-or-nothing undo across the whole run. The first failure stops the run
+//  and reports which step it was; everything before it stays applied.
+// ═══════════════════════════════════════════════════════════
+
+// modeId must name a mode in SS_SORT_MODES. minTabs is the run of slots the
+// category reserves before any overflow borrowing.
+const SS_AUTO_LAYOUT = [
+  { modeId: 'uniqueGear',     minTabs: 5 },  // tabs 1-5
+  { modeId: 'uniqueRingAmu',  minTabs: 1 },  // tab 6
+  { modeId: 'rareRingAmu',    minTabs: 1 },  // tab 7
+  { modeId: 'magicRingAmu',   minTabs: 1 },  // tab 8
+  { modeId: 'uniqueCharm',    minTabs: 1 },  // tab 9
+  { modeId: 'magicCharm',     minTabs: 2 },  // tabs 10-11
+  { modeId: 'uniqueJewel',    minTabs: 1 },  // tab 12
+  { modeId: 'rareMagicJewel', minTabs: 1 },  // tab 13
+  { modeId: 'set',            minTabs: 6 },  // tabs 14-19
+  { modeId: 'rareGear',       minTabs: 1 },  // tab 20 onwards, grows by borrowing
+];
+
+// Step 0. Only empty tabs sitting BEHIND a sort's last target can be borrowed
+// (see _ssPrepareInPlaceSort's emptyPool), so an empty tab stranded in the
+// middle of the stash is dead weight the run cannot use. Sliding them all to
+// the end first is a pure tab reorder — no item bytes move — and it is what
+// keeps a stash with enough total room from failing halfway through.
+function _ssCompactEmptyTabsToEnd() {
+  const regular = _ssRegularTabIndices();
+  const nonEmpty = [], empty = [];
+  for (const i of regular) {
+    (sharedStashParsed.tabs[i].items.length ? nonEmpty : empty).push(i);
+  }
+  const order = nonEmpty.concat(empty);
+  if (order.every((v, k) => v === regular[k])) return { ok: true, changed: false };
+  return { ok: _ssReorderRegularTabs(order), changed: true };
+}
+
+// Sorted items only — swept strays ride along in plan.placements but belong to
+// no stream, so they must not be counted as "sorted N items".
+function _ssPlanSortedItemCount(plan) {
+  let n = 0;
+  for (const p of plan.placements) {
+    if (p.mi.streamIdx === undefined) continue;
+    n += 1 + p.mi.children.length;
+  }
+  return n;
+}
+
+// Runs the layout top to bottom. Returns { steps, failed }, where failed is
+// null on a clean run and otherwise names the step that stopped it. Every
+// mutation is already committed by the time this returns — the caller only
+// reports.
+function _ssRunAutoSort() {
+  const steps = [];
+
+  const backup0 = sharedStashData.slice();
+  try {
+    const compact = _ssCompactEmptyTabsToEnd();
+    if (!compact.ok) throw new Error('tab reorder failed');
+    if (compact.changed) {
+      if (_ssChainOkAtLoad) {
+        const problem = validateSharedStashChain(sharedStashData) || validateSharedStashRecords();
+        if (problem) throw new Error(problem);
+      }
+      markSharedStashDirty();
+      renderSharedStashTabs();
+    }
+  } catch (e) {
+    sharedStashData = backup0;
+    parseSharedStash();
+    renderSharedStashTabs();
+    console.error('Auto sort compaction rolled back:', e);
+    return { steps, failed: { n: 0, label: L('ui_ss_auto_step_compact', 'Move empty tabs to the end'),
+                              reason: 'reverted', detail: e.message } };
+  }
+
+  // Slot position (index into _ssRegularTabIndices()) the next category starts
+  // at. Re-resolved to physical indices every step, because a borrowed tab
+  // moving into place renumbers everything behind it.
+  let cursor = 0;
+
+  for (let k = 0; k < SS_AUTO_LAYOUT.length; k++) {
+    const spec = SS_AUTO_LAYOUT[k];
+    const mode = _ssSortMode(spec.modeId);
+    const stepInfo = { n: k + 1, label: mode.label() };
+    const regular = _ssRegularTabIndices();
+
+    if (cursor >= regular.length) {
+      return { steps, failed: { ...stepInfo, reason: 'noSlots' } };
+    }
+    const dests = regular.slice(cursor, cursor + spec.minTabs);
+
+    const res = _ssPrepareInPlaceSort(mode, regular, dests);
+
+    // Nothing of this category anywhere in the stash. Reserving empty tabs for
+    // a category the user does not own would only push the rest of the layout
+    // along, so the run closes the gap instead.
+    if (res.error === 'empty' || res.error === 'noSource') {
+      steps.push({ ...stepInfo, skipped: true });
+      continue;
+    }
+    if (res.error) {
+      return { steps, failed: { ...stepInfo, reason: res.error, borrowed: res.borrowed } };
+    }
+
+    const applied = _ssApplyInPlaceSort(res, { keepStraysAtEnd: true });
+    if (applied.error) {
+      return { steps, failed: { ...stepInfo, reason: 'reverted', detail: applied.detail } };
+    }
+
+    const span = dests.length + res.sortExtras.length;
+    steps.push({ ...stepInfo, items: _ssPlanSortedItemCount(res.plan), tabs: span,
+                 strayTabs: res.strayTabs.length });
+    cursor += span;
+  }
+
+  return { steps, failed: null };
+}
+
+function _ssAutoSortFailureText(f) {
+  switch (f.reason) {
+    case 'noRoom':
+      return Lfmt('ui_ss_auto_fail_room',
+        'Not enough room — the reserved tabs plus every spare empty tab behind them ({borrowed} used) could not hold everything.',
+        { borrowed: f.borrowed || 0 });
+    case 'noStrayTab':
+      return L('ui_ss_auto_fail_stray',
+        'The reserved tabs hold items this category does not sort, and there is no empty tab left at the end of the stash to move them into.');
+    case 'noSlots':
+      return L('ui_ss_auto_fail_slots', 'The stash ran out of tabs before this category got its turn.');
+    case 'reverted':
+      return Lfmt('ui_ss_auto_fail_reverted', 'The step failed and was rolled back. ({detail})',
+        { detail: f.detail || '' });
+    default:
+      return Lfmt('ui_ss_auto_fail_other', 'The step could not run. ({detail})', { detail: f.reason });
+  }
+}
+
+// One click: confirm, run, report. Everything the user has to know up front —
+// which categories land where, and that a failure stops the run without
+// undoing the steps already committed — goes in the confirmation.
+window.ssAutoSortRun = function() {
+  if (!sharedStashParsed) return;
+  if (_ssDraftDirty()) {
+    showPopup(L('ui_ss_arrange_pending_block',
+      'Apply or revert the pending tab arrangement before sorting.'));
+    return;
+  }
+
+  // Slot numbers as the layout would come out with no overflow at all — the
+  // shape the user asked for, and what they see if every category fits.
+  let slot = 1;
+  const lines = SS_AUTO_LAYOUT.map(spec => {
+    const mode = _ssSortMode(spec.modeId);
+    const from = slot, to = slot + spec.minTabs - 1;
+    slot = to + 1;
+    const span = (spec === SS_AUTO_LAYOUT[SS_AUTO_LAYOUT.length - 1])
+      ? Lfmt('ui_ss_auto_tab_onwards', 'Tab {from}+', { from })
+      : (from === to ? Lfmt('ui_ss_auto_tab_one', 'Tab {n}', { n: from })
+                     : Lfmt('ui_ss_auto_tab_range', 'Tabs {from}-{to}', { from, to }));
+    return `${span}: ${mode.label()}`;
+  });
+
+  const msg = L('ui_ss_auto_confirm_intro', 'Rearrange the whole shared stash into this layout?')
+    + '\n\n' + lines.join('\n') + '\n\n'
+    + L('ui_ss_auto_confirm_note',
+        'Empty tabs are moved to the end first. A category with more items than its tabs hold borrows empty tabs and pushes everything after it along; one with fewer leaves the rest of its tabs empty. Items no category claims are swept to tabs at the very end and left unsorted. Each step commits on its own — if one fails it rolls itself back and the run stops there, keeping the steps before it.');
+
+  showConfirm(msg, () => {
+    const run = _ssRunAutoSort();
+    const done = run.steps.filter(s => !s.skipped);
+    const items = done.reduce((s, x) => s + x.items, 0);
+    const tabs = done.reduce((s, x) => s + x.tabs, 0);
+
+    let out = run.failed
+      ? Lfmt('ui_ss_auto_failed', 'Auto sort stopped at step {n} ({label}). {why} Nothing from that step was applied; the {ok} step(s) before it are done.',
+          { n: run.failed.n, label: run.failed.label, why: _ssAutoSortFailureText(run.failed), ok: run.steps.length })
+      : Lfmt('ui_ss_auto_done', 'Auto sort complete — {items} item(s) across {tabs} tab(s).',
+          { items, tabs });
+
+    if (done.length) {
+      out += '\n\n' + done.map(s => Lfmt('ui_ss_auto_step_line', '{label}: {items} item(s), {tabs} tab(s)',
+        { label: s.label, items: s.items, tabs: s.tabs })).join('\n');
+    }
+    const skipped = run.steps.filter(s => s.skipped);
+    if (skipped.length) {
+      out += '\n\n' + Lfmt('ui_ss_auto_skipped', 'Skipped (nothing found): {list}',
+        { list: skipped.map(s => s.label).join(', ') });
+    }
+    showPopup(out);
+  }, L('ui_ss_auto_confirm_btn', 'Auto Sort'));
+};
 
 // ── Sort Items modal ──
 // Step 0 picks the sort mode, step 1 the tabs to collect from, step 2 which
@@ -18035,6 +18247,7 @@ function renderSharedStashTabs() {
         + (_ssSwapMode ? esc(L('ui_ss_arrange_mode_on', 'Arranging Tabs')) : esc(L('ui_ss_arrange_mode_off', 'Arrange Tabs')))
         + `</button>`;
   html += `<button type="button" class="btn" style="margin:0" onclick="openSortItemsModal()">${esc(L('ui_ss_sort_btn2', 'Sort Items'))}</button>`;
+  html += `<button type="button" class="btn" style="margin:0" title="${esc(L('ui_ss_auto_sort_tip', 'Sort every category into a fixed stash layout in one go.'))}" onclick="ssAutoSortRun()">${esc(L('ui_ss_auto_sort_btn', 'Auto Sort'))}</button>`;
   html += `</div>`;
   // The last empty regular tab is what an "insert empty tab" borrows; with
   // none left the + buttons are disabled rather than failing on click.

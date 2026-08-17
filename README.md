@@ -44,6 +44,13 @@ The editor relies on external data from the D2R Reimagined repository (item data
 - Specialty tab splitting (gems, runes, materials)
 - Item search across tabs
 - Grid rendering consistent with in-game layout
+- Tab arrangement: reorder shared stash tabs by drag & drop, staged behind Apply / Revert
+- Sort Items: per-category sorting (unique/crafted gear, rare gear, set items, rings & amulets,
+  charms, jewels) into tabs you pick
+- Auto Sort: one click, sorts every category into a fixed stash layout — crafted & unique gear
+  (tabs 1-5), rings & amulets by rarity (6-8), charms (9-11), jewels (12-13), set items (14-19),
+  rare gear (20+). Categories that overflow borrow empty tabs and push the rest of the layout
+  along; each step commits on its own and rolls itself back if it fails
 
 ### Vault System
 - Load and save `.d2i` vault files
