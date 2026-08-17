@@ -50,7 +50,9 @@ The editor relies on external data from the D2R Reimagined repository (item data
 - Auto Sort: one click, sorts every category into a fixed stash layout — crafted & unique gear
   (tabs 1-5), rings & amulets by rarity (6-8), charms (9-11), jewels (12-13), set items (14-19),
   rare gear (20+). Categories that overflow borrow empty tabs and push the rest of the layout
-  along; each step commits on its own and rolls itself back if it fails
+  along; ones that come up short keep their tabs blank, and a category you own nothing of is
+  still handed its tabs once everything else is placed. Each step commits on its own and rolls
+  itself back if it fails
 
 ### Vault System
 - Load and save `.d2i` vault files

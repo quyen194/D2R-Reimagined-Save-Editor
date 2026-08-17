@@ -17646,6 +17646,12 @@ function _ssApplyInPlaceSort(res, opts) {
 //  starts further along. A category with too few items leaves the tail of its
 //  run empty, which is the padding the layout asks for.
 //
+//  A category the user owns nothing of has no sort to run, so it is passed
+//  over and claims its quota afterwards instead — see _ssPadAutoLayout. Doing
+//  it in that order means the tab budget never has to be predicted: every
+//  category with items is served from the real stash first, and the blank ones
+//  divide up whatever is genuinely left.
+//
 //  Each step commits (or rolls itself back) on its own — there is no
 //  all-or-nothing undo across the whole run. The first failure stops the run
 //  and reports which step it was; everything before it stays applied.
@@ -17725,25 +17731,37 @@ function _ssRunAutoSort() {
   // at. Re-resolved to physical indices every step, because a borrowed tab
   // moving into place renumbers everything behind it.
   let cursor = 0;
+  // Where each category ended up, for the padding pass below: `end` is the
+  // slot just past its run, `tabs` how many slots it took.
+  const spans = [];
 
   for (let k = 0; k < SS_AUTO_LAYOUT.length; k++) {
     const spec = SS_AUTO_LAYOUT[k];
     const mode = _ssSortMode(spec.modeId);
-    const stepInfo = { n: k + 1, label: mode.label() };
+    const stepInfo = { n: k + 1, label: mode.label(), items: 0, tabs: 0 };
     const regular = _ssRegularTabIndices();
 
     if (cursor >= regular.length) {
       return { steps, failed: { ...stepInfo, reason: 'noSlots' } };
     }
+    // The category's WHOLE quota, not just the tabs its items will fill. Every
+    // one of them is a target, so every one gets emptied out, and the planner
+    // lays items down in reading order without ever backfilling behind its
+    // cursor — so a quota of 6 that the items exhaust after 3 leaves tabs 4-6
+    // sitting blank exactly where the layout wants them. Only a quota that
+    // runs off the end of the stash comes up short here, and the padding pass
+    // picks that up along with the categories that had nothing to sort.
     const dests = regular.slice(cursor, cursor + spec.minTabs);
 
     const res = _ssPrepareInPlaceSort(mode, regular, dests);
 
-    // Nothing of this category anywhere in the stash. Reserving empty tabs for
-    // a category the user does not own would only push the rest of the layout
-    // along, so the run closes the gap instead.
+    // Nothing of this category anywhere in the stash, so there is nothing to
+    // sort and no target tabs get reserved. Its quota is not forfeited — the
+    // padding pass below comes back for it once every category that does have
+    // items is settled.
     if (res.error === 'empty' || res.error === 'noSource') {
       steps.push({ ...stepInfo, skipped: true });
+      spans.push({ spec, mode, tabs: 0, end: cursor });
       continue;
     }
     if (res.error) {
@@ -17758,10 +17776,90 @@ function _ssRunAutoSort() {
     const span = dests.length + res.sortExtras.length;
     steps.push({ ...stepInfo, items: _ssPlanSortedItemCount(res.plan), tabs: span,
                  strayTabs: res.strayTabs.length });
+    spans.push({ spec, mode, tabs: span, end: cursor + span });
     cursor += span;
   }
 
-  return { steps, failed: null };
+  // Padding is its own step with its own rollback: it is pure tab movement on
+  // top of a layout that is already correct, so a failure here must not cost
+  // the sorting that just succeeded.
+  const noPadding = () => ({ added: spans.map(() => 0),
+                             short: spans.map(s => Math.max(0, s.spec.minTabs - s.tabs)),
+                             total: 0 });
+  const backupPad = sharedStashData.slice();
+  let padding;
+  try {
+    padding = _ssPadAutoLayout(spans);
+    if (padding.total) {
+      if (_ssChainOkAtLoad) {
+        const problem = validateSharedStashChain(sharedStashData) || validateSharedStashRecords();
+        if (problem) throw new Error(problem);
+      }
+      markSharedStashDirty();
+      renderSharedStashTabs();
+    }
+  } catch (e) {
+    sharedStashData = backupPad;
+    parseSharedStash();
+    renderSharedStashTabs();
+    console.error('Auto sort padding rolled back:', e);
+    padding = { ...noPadding(), error: e.message };
+  }
+  for (let k = 0; k < steps.length; k++) steps[k].tabs += padding.added[k];
+
+  return { steps, padding, failed: null };
+}
+
+// Hands every category that came up short of its quota the tabs it is owed,
+// one per round, top to bottom, until the quotas are met or the stash has no
+// empty tab left to give. Round-robin rather than filling the first category
+// first: when there is not enough to go round, the shortfall should be shared
+// out instead of landing entirely on the categories at the bottom.
+//
+// The shortfall is measured against what a category actually ended up with, so
+// this covers any reason it came up short. In practice that means a category
+// with no items to sort (which reserved nothing) or one whose quota ran past
+// the last tab in the stash; a category that sorted normally already holds its
+// whole quota, blank tabs included, and asks for nothing here.
+function _ssPadAutoLayout(spans) {
+  const deficit = spans.map(s => Math.max(0, s.spec.minTabs - s.tabs));
+  const added = spans.map(() => 0);
+
+  let exhausted = false;
+  while (!exhausted) {
+    let handedOut = 0;
+    for (let k = 0; k < spans.length; k++) {
+      if (deficit[k] <= 0) continue;
+      if (!_ssInsertPaddingTab(spans, k)) { exhausted = true; break; }
+      deficit[k]--;
+      added[k]++;
+      handedOut++;
+    }
+    if (!handedOut) break;      // every quota met
+  }
+  return { added, short: deficit, exhausted, total: added.reduce((a, b) => a + b, 0) };
+}
+
+// Slides one empty tab from behind the whole layout into the slot just past
+// category k's run, pushing every later tab one place along — the same
+// rotation the sort's own overflow borrowing uses, and it moves no item bytes.
+// Returns false when no empty tab is left, which is the only way padding stops
+// short.
+function _ssInsertPaddingTab(spans, k) {
+  const regular = _ssRegularTabIndices();
+  const layoutEnd = spans[spans.length - 1].end;
+
+  // Never take a tab from inside the layout — those are already somebody's.
+  let src = -1;
+  for (let p = layoutEnd; p < regular.length; p++) {
+    if (sharedStashParsed.tabs[regular[p]].items.length === 0) { src = p; break; }
+  }
+  if (src < 0) return false;
+
+  const dst = spans[k].end;
+  if (src !== dst && !_ssMoveRegularTabContent(regular[src], regular[dst])) return false;
+  for (let j = k; j < spans.length; j++) spans[j].end++;
+  return true;
 }
 
 function _ssAutoSortFailureText(f) {
@@ -17811,13 +17909,12 @@ window.ssAutoSortRun = function() {
   const msg = L('ui_ss_auto_confirm_intro', 'Rearrange the whole shared stash into this layout?')
     + '\n\n' + lines.join('\n') + '\n\n'
     + L('ui_ss_auto_confirm_note',
-        'Empty tabs are moved to the end first. A category with more items than its tabs hold borrows empty tabs and pushes everything after it along; one with fewer leaves the rest of its tabs empty. Items no category claims are swept to tabs at the very end and left unsorted. Each step commits on its own — if one fails it rolls itself back and the run stops there, keeping the steps before it.');
+        'Empty tabs are moved to the end first. A category with more items than its tabs hold borrows empty tabs and pushes everything after it along; one with fewer leaves the rest of its tabs empty. A category you own nothing of is sorted last of all: once everything else is settled it is handed its blank tabs one at a time, sharing whatever empty tabs are left with the other empty categories. Items no category claims are swept to tabs at the very end and left unsorted. Each step commits on its own — if one fails it rolls itself back and the run stops there, keeping the steps before it.');
 
   showConfirm(msg, () => {
     const run = _ssRunAutoSort();
-    const done = run.steps.filter(s => !s.skipped);
-    const items = done.reduce((s, x) => s + x.items, 0);
-    const tabs = done.reduce((s, x) => s + x.tabs, 0);
+    const items = run.steps.reduce((s, x) => s + x.items, 0);
+    const tabs = run.steps.reduce((s, x) => s + x.tabs, 0);
 
     let out = run.failed
       ? Lfmt('ui_ss_auto_failed', 'Auto sort stopped at step {n} ({label}). {why} Nothing from that step was applied; the {ok} step(s) before it are done.',
@@ -17825,14 +17922,28 @@ window.ssAutoSortRun = function() {
       : Lfmt('ui_ss_auto_done', 'Auto sort complete — {items} item(s) across {tabs} tab(s).',
           { items, tabs });
 
-    if (done.length) {
-      out += '\n\n' + done.map(s => Lfmt('ui_ss_auto_step_line', '{label}: {items} item(s), {tabs} tab(s)',
+    if (run.steps.length) {
+      out += '\n\n' + run.steps.map(s => Lfmt('ui_ss_auto_step_line', '{label}: {items} item(s), {tabs} tab(s)',
         { label: s.label, items: s.items, tabs: s.tabs })).join('\n');
     }
     const skipped = run.steps.filter(s => s.skipped);
     if (skipped.length) {
-      out += '\n\n' + Lfmt('ui_ss_auto_skipped', 'Skipped (nothing found): {list}',
+      out += '\n\n' + Lfmt('ui_ss_auto_skipped', 'Nothing found for: {list} — their tabs were left blank.',
         { list: skipped.map(s => s.label).join(', ') });
+    }
+    const pad = run.padding;
+    if (pad && pad.short.some(n => n > 0)) {
+      const list = run.steps
+        .map((s, k) => pad.short[k] > 0 ? `${s.label} (${pad.short[k]})` : null)
+        .filter(Boolean).join(', ');
+      out += '\n\n' + Lfmt('ui_ss_auto_pad_short',
+        'The stash ran out of empty tabs before every blank category got its full quota — still owed: {list}.',
+        { list });
+    }
+    if (pad && pad.error) {
+      out += '\n\n' + Lfmt('ui_ss_auto_pad_failed',
+        'Reserving the blank tabs failed and was rolled back, so the sorted tabs are correct but the blank ones are missing. ({detail})',
+        { detail: pad.error });
     }
     showPopup(out);
   }, L('ui_ss_auto_confirm_btn', 'Auto Sort'));
