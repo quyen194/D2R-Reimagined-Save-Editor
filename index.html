@@ -16117,16 +16117,59 @@ function _selectStashRecords(candidates, count, isSpecialtyTab) {
   return candidates.slice(0, count);
 }
 
+// Locates every item-bearing section's "JM" marker by walking the page chain
+// exactly the way the game client does: start at byte 0, read each 64-byte
+// header's own length at +0x10, jump to the next header, check the magic.
+// pageType=2 sections (Reimagined's trailing block) carry no item list at all,
+// so they are skipped rather than reported.
+//
+// Returns null when the chain does not walk cleanly to EOF, so the caller can
+// fall back to the old byte scan and still open an already-damaged file.
+function _ssPageChainJmOffsets(buf) {
+  const out = [];
+  let off = 0;
+  // 68 = 64-byte header + "JM" + u16 count, the smallest legal section.
+  while (off + 68 <= buf.length) {
+    if (readU32LE(buf, off) !== 0xaa55aa55) return null;
+    const len = readU32LE(buf, off + 0x10);
+    if (len < 68 || off + len > buf.length) return null;
+    const pageType = readU32LE(buf, off + 0x14);
+    if (pageType === 0 || pageType === 1) {
+      if (buf[off + 0x40] !== 0x4a || buf[off + 0x41] !== 0x4d) return null;
+      out.push(off + 0x40);
+    }
+    off += len;
+  }
+  return off === buf.length ? out : null;
+}
+
 function parseSharedStash() {
   const buf = sharedStashData;
   if (!buf) { sharedStashParsed = null; return; }
 
   const gold = (buf[12] | (buf[13]<<8) | (buf[14]<<16) | (buf[15]<<24)) >>> 0;
 
-  // Find JM markers
-  const jmPositions = [];
-  for (let i = 0x40; i < buf.length - 1; i++) {
-    if (buf[i] === 0x4a && buf[i+1] === 0x4d) jmPositions.push(i);
+  // ── Locate the sections ──
+  // Section starts come from the page chain, NOT from scanning the file for
+  // the bytes "JM". The scan is unsafe: 0x4A 0x4D occurs by chance inside
+  // compressed item data (a real 202-page stash carries one at 0x44AC, in the
+  // middle of page 6). Every phantom marker did three things at once — it
+  // truncated the page it landed in at the phantom's own position, invented an
+  // extra tab whose count/pageType were read out of item bytes (13796 items,
+  // pageType 3155702283), and shifted every later tab index by one. That last
+  // one is what broke saves: Auto Sort addresses tabs by index, so it wrote
+  // item data into the wrong sections and the client bailed to character
+  // select. The phantom also failed validateSharedStashRecords() on load,
+  // which cleared _ssChainOkAtLoad and thereby disabled the save gate that
+  // would otherwise have caught the damage before it reached disk.
+  let jmPositions = _ssPageChainJmOffsets(buf);
+  if (!jmPositions) {
+    console.warn('parseSharedStash: page chain does not walk cleanly to EOF — '
+      + 'falling back to a "JM" byte scan (tab boundaries may be unreliable)');
+    jmPositions = [];
+    for (let i = 0x40; i < buf.length - 1; i++) {
+      if (buf[i] === 0x4a && buf[i+1] === 0x4d) jmPositions.push(i);
+    }
   }
 
   const rb = (byteOff, bitStart, n) => {
