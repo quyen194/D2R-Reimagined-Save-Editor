@@ -22,8 +22,13 @@ its schema exactly.
   names matter — the `build*Map`/`build*Table` functions in `index.html`
   index rows by specific header names (case varies, e.g. `row['*Id']` vs
   `row['Id']`), so preserve headers exactly if a file is regenerated.
-- **`*.json`** (20 files) — structured data: `items.json`, `sets.json`,
+- **`*.json`** (21 files) — structured data: `items.json`, `sets.json`,
   `categories.json`, `item_meta.json`, `globaldatahd.json`, etc.
+- **`autosort.json`** — the one file here that is editor configuration rather
+  than game data: the default shared-stash Auto Sort layout. Mirrored by
+  `SS_AUTOSORT_BUILTIN` in `index.html` (the fallback if the fetch fails) and
+  overridable per-browser through the ⚙ dialog, so keep the two in sync when
+  changing a default. Schema is documented in the root `README.md`.
 - **`basechars/*.d2s`** — template save files, one per class (`BaseBarb`,
   `BaseSorc`, ...), used as a starting point (e.g. for new-character
   creation/reset flows).

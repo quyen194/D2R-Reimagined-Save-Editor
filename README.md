@@ -53,6 +53,9 @@ The editor relies on external data from the D2R Reimagined repository (item data
   along; ones that come up short keep their tabs blank, and a category you own nothing of is
   still handed its tabs once everything else is placed. Each step commits on its own and rolls
   itself back if it fails
+- Auto Sort settings (⚙ next to the button): the layout and the run's behaviour come from
+  [`base/autosort.json`](base/autosort.json) and can be overridden per browser. Edit the JSON in
+  place, or Import / Export it as a file. See [Auto Sort settings](#auto-sort-settings) below
 
 ### Vault System
 - Load and save `.d2i` vault files
@@ -123,6 +126,77 @@ On startup, the editor performs:
 4. Fallback to local copies if remote fetch fails
 
 Failure to load required data prevents the editor from initializing.
+
+---
+
+## Auto Sort settings
+
+The shared stash Auto Sort reads its layout from [`base/autosort.json`](base/autosort.json).
+Three layers apply, each overriding the one before it:
+
+1. A built-in copy of the same layout, so Auto Sort still works if nothing loads
+2. `base/autosort.json` — the default this repo ships
+3. Your own override, saved in this browser via the ⚙ button next to Auto Sort
+
+The ⚙ dialog edits the effective config as JSON. **Apply** saves it to this browser only,
+**Reset** drops it and goes back to the bundled default, and **Export** / **Import** move it
+around as a file. The dialog never sorts anything — close it and press Auto Sort when ready.
+
+A field that isn't valid falls back to the layer below and is reported; a broken config can
+make the layout ugly, but it can't make the sort do something unsafe.
+
+### Global options
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `version` | number | `1` | Schema version |
+| `startTab` | integer ≥ 0 | `0` | Leave the first N tabs completely alone — not sorted, not used as a source, not borrowed. Your junk/mule tabs |
+| `compactEmptyTabsFirst` | boolean | `true` | Slide empty tabs to the end before sorting. Turning it off strands empty tabs mid-stash, which makes "not enough room" failures far more likely |
+| `padding` | `roundRobin` \| `inOrder` \| `off` | `roundRobin` | How blank tabs are handed to categories that came up short of `minTabs`. `roundRobin` shares a shortage out; `inOrder` fills the top of the list first; `off` hands out nothing |
+| `addEmptyPageWhen` | `"never"` \| `"always"` \| 0–100 | `30` | Give a category one extra empty tab when the **last tab of its run** is more than this percent full. `"always"` is the same as `0`. Independent of `padding` |
+| `continueOnFailure` | boolean | `false` | Keep going past a category that fails instead of stopping the run there |
+| `skipConfirm` | boolean | `false` | Skip the confirmation dialog |
+
+### Per-category options
+
+The order of the `categories` array **is** the tab order — swap two entries to swap two
+categories.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `modeId` | string | required | One of the sort modes listed below |
+| `minTabs` | integer ≥ 1 | `1` | Tabs the category reserves before it has to borrow more |
+| `enabled` | boolean | `true` | `false` skips the category entirely — its items are left untouched and it claims no tabs |
+| `addEmptyPageWhen` | as above | inherits the global | Per-category override |
+
+Valid `modeId` values: `set`, `uniqueGear`, `rareGear`, `uniqueCharm`, `magicCharm`,
+`uniqueJewel`, `rareMagicJewel`, `uniqueRingAmu`, `rareRingAmu`, `magicRingAmu`.
+
+### Example
+
+```json
+{
+  "version": 1,
+  "startTab": 0,
+  "compactEmptyTabsFirst": true,
+  "padding": "roundRobin",
+  "addEmptyPageWhen": 30,
+  "continueOnFailure": false,
+  "skipConfirm": false,
+  "categories": [
+    { "modeId": "uniqueGear",     "minTabs": 5, "enabled": true },
+    { "modeId": "uniqueRingAmu",  "minTabs": 1, "enabled": true },
+    { "modeId": "rareRingAmu",    "minTabs": 1, "enabled": true },
+    { "modeId": "magicRingAmu",   "minTabs": 1, "enabled": true },
+    { "modeId": "uniqueCharm",    "minTabs": 1, "enabled": true },
+    { "modeId": "magicCharm",     "minTabs": 2, "enabled": true },
+    { "modeId": "uniqueJewel",    "minTabs": 1, "enabled": true },
+    { "modeId": "rareMagicJewel", "minTabs": 1, "enabled": true },
+    { "modeId": "set",            "minTabs": 6, "enabled": true, "addEmptyPageWhen": "always" },
+    { "modeId": "rareGear",       "minTabs": 1, "enabled": true, "addEmptyPageWhen": "never" }
+  ]
+}
+```
 
 ---
 

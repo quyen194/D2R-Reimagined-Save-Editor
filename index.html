@@ -1253,7 +1253,7 @@ const STRINGS_BASE = 'https://raw.githubusercontent.com/D2R-Reimagined/d2r-reima
 // now hosted as JSON alongside the base/ folder. Falls back to the bundled
 // local copies when GitHub is unreachable (same pattern as the mod txt data).
 const EDITOR_DATA_URL = 'https://raw.githubusercontent.com/GildyBoye/D2R-Reimagined-Save-Editor/main/base/';
-const EDITOR_DATA_FILES = ['item_meta.json', 'templates.json', 'sprites.json', 'wheel.json', 'stat_def.json', 'categories.json'];
+const EDITOR_DATA_FILES = ['item_meta.json', 'templates.json', 'sprites.json', 'wheel.json', 'stat_def.json', 'categories.json', 'autosort.json'];
 // Actual string JSON files confirmed in the repo
 const STRING_FILES = [
   'item-names.json',         // weapon and armour display names
@@ -1805,6 +1805,11 @@ async function loadEditorData(timeout) {
     if (cats.uniqueSub && typeof cats.uniqueSub === 'object') _UNIQUE_SUBCATEGORY_KEYS  = cats.uniqueSub;
     if (cats.baseTypes && typeof cats.baseTypes === 'object') _BASE_TYPE_CATEGORY_NAMES = cats.baseTypes;
   }
+
+  // autosort.json → the shared stash Auto Sort layout. A miss just leaves
+  // SS_AUTOSORT_BUILTIN in charge, which is the same layout this file ships.
+  const autoSort = await _fetchEditorJson('autosort.json', timeout);
+  if (autoSort) _ssSetAutoSortBaseConfig(autoSort);
 
   // D2R-Reimagined HD sprite-path mappings — fetched from the mod repo so
   // the editor stays in sync with upstream. Only consumed when the user flips
@@ -17700,33 +17705,232 @@ function _ssApplyInPlaceSort(res, opts) {
 //  and reports which step it was; everything before it stays applied.
 // ═══════════════════════════════════════════════════════════
 
+// ── Auto Sort configuration ─────────────────────────────────
+//
+// Three layers, each one overriding the last:
+//   1. SS_AUTOSORT_BUILTIN below — the lifeboat. Whatever else fails, this
+//      runs, so it is kept identical to what base/autosort.json ships.
+//   2. base/autosort.json — the default the repo ships, fetched at startup
+//      alongside the other editor JSON (see loadEditorData).
+//   3. localStorage — the user's own override, edited through the ⚙ button
+//      next to Auto Sort.
+//
+// Every layer goes through the same validator, and a bad field only ever
+// costs that field: it falls back to the layer below and logs a warning.
+// A config can make the layout ugly; it must never be able to make the sort
+// do something unsafe.
+const SS_AUTOSORT_SCHEMA_VERSION = 1;
+const SS_AUTOSORT_LS_KEY = 'd2rse_ss_autosort_cfg';
+const SS_AUTOSORT_PADDING_MODES = ['roundRobin', 'inOrder', 'off'];
+
 // modeId must name a mode in SS_SORT_MODES. minTabs is the run of slots the
-// category reserves before any overflow borrowing.
-const SS_AUTO_LAYOUT = [
-  { modeId: 'uniqueGear',     minTabs: 5 },  // tabs 1-5
-  { modeId: 'uniqueRingAmu',  minTabs: 1 },  // tab 6
-  { modeId: 'rareRingAmu',    minTabs: 1 },  // tab 7
-  { modeId: 'magicRingAmu',   minTabs: 1 },  // tab 8
-  { modeId: 'uniqueCharm',    minTabs: 1 },  // tab 9
-  { modeId: 'magicCharm',     minTabs: 2 },  // tabs 10-11
-  { modeId: 'uniqueJewel',    minTabs: 1 },  // tab 12
-  { modeId: 'rareMagicJewel', minTabs: 1 },  // tab 13
-  { modeId: 'set',            minTabs: 6 },  // tabs 14-19
-  { modeId: 'rareGear',       minTabs: 1 },  // tab 20 onwards, grows by borrowing
-];
+// category reserves before any overflow borrowing. addEmptyPageWhen is null
+// here, meaning "inherit the global setting".
+const SS_AUTOSORT_BUILTIN = {
+  version: SS_AUTOSORT_SCHEMA_VERSION,
+  startTab: 0,
+  compactEmptyTabsFirst: true,
+  padding: 'roundRobin',
+  addEmptyPageWhen: 30,
+  continueOnFailure: false,
+  skipConfirm: false,
+  categories: [
+    { modeId: 'uniqueGear',     minTabs: 5, enabled: true, addEmptyPageWhen: null },      // tabs 1-5
+    { modeId: 'uniqueRingAmu',  minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 6
+    { modeId: 'rareRingAmu',    minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 7
+    { modeId: 'magicRingAmu',   minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 8
+    { modeId: 'uniqueCharm',    minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 9
+    { modeId: 'magicCharm',     minTabs: 2, enabled: true, addEmptyPageWhen: null },      // tabs 10-11
+    { modeId: 'uniqueJewel',    minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 12
+    { modeId: 'rareMagicJewel', minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 13
+    { modeId: 'set',            minTabs: 6, enabled: true, addEmptyPageWhen: 0 },         // tabs 14-19
+    { modeId: 'rareGear',       minTabs: 1, enabled: true, addEmptyPageWhen: 'never' },   // tab 20 onwards
+  ],
+};
+
+let _ssAutoSortBaseRaw = null;   // parsed base/autosort.json, unvalidated
+let _ssAutoSortCache = null;     // memoised effective config
+let _ssAutoSortWarnings = [];    // warnings from the last effective-config build
+
+function _ssSetAutoSortBaseConfig(raw) {
+  _ssAutoSortBaseRaw = raw;
+  _ssAutoSortCache = null;
+  // Surface base-file problems in the startup log — nobody is looking at the
+  // shared stash yet, and a typo the maintainer committed should be loud.
+  const w = [];
+  _ssMergeAutoSortConfig(SS_AUTOSORT_BUILTIN, raw, 'autosort.json', w);
+  for (const msg of w) addLog('warn', '⚠ ' + msg);
+}
+
+// "never" | "always" | 0-100 → 'never' | number. Numeric strings are accepted
+// because the settings textarea is hand-edited. null means "not valid".
+function _ssNormEmptyPageRule(v) {
+  if (v === 'never') return 'never';
+  if (v === 'always') return 0;
+  const n = (typeof v === 'string' && v.trim() !== '') ? Number(v) : v;
+  if (typeof n === 'number' && isFinite(n) && n >= 0 && n <= 100) return n;
+  return null;
+}
+
+function _ssNormInt(v, min, max) {
+  const n = (typeof v === 'string' && v.trim() !== '') ? Number(v) : v;
+  if (typeof n !== 'number' || !isFinite(n) || Math.floor(n) !== n) return null;
+  if (n < min || n > max) return null;
+  return n;
+}
+
+// Returns a NEW valid config: `base` with every valid field of `raw` applied
+// over it. Anything invalid is dropped with a warning, so the result is always
+// safe to run. `label` names the source in those warnings.
+function _ssMergeAutoSortConfig(base, raw, label, warnings) {
+  const warn = (m) => warnings.push(`${label}: ${m}`);
+  if (raw === null || raw === undefined) return base;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    warn('not a JSON object — ignored.');
+    return base;
+  }
+
+  const out = { ...base, categories: base.categories };
+
+  if ('version' in raw && raw.version !== SS_AUTOSORT_SCHEMA_VERSION) {
+    warn(`version ${JSON.stringify(raw.version)} is not ${SS_AUTOSORT_SCHEMA_VERSION} — loading it anyway.`);
+  }
+  if ('startTab' in raw) {
+    const n = _ssNormInt(raw.startTab, 0, 999);
+    if (n === null) warn(`startTab must be a whole number >= 0 — kept ${out.startTab}.`);
+    else out.startTab = n;
+  }
+  if ('padding' in raw) {
+    if (SS_AUTOSORT_PADDING_MODES.includes(raw.padding)) out.padding = raw.padding;
+    else warn(`padding must be one of ${SS_AUTOSORT_PADDING_MODES.join(' / ')} — kept "${out.padding}".`);
+  }
+  if ('addEmptyPageWhen' in raw) {
+    const r = _ssNormEmptyPageRule(raw.addEmptyPageWhen);
+    if (r === null) warn('addEmptyPageWhen must be "never", "always" or a number 0-100 — kept ' + JSON.stringify(out.addEmptyPageWhen) + '.');
+    else out.addEmptyPageWhen = r;
+  }
+  for (const flag of ['compactEmptyTabsFirst', 'continueOnFailure', 'skipConfirm']) {
+    if (!(flag in raw)) continue;
+    if (typeof raw[flag] === 'boolean') out[flag] = raw[flag];
+    else warn(`${flag} must be true or false — kept ${out[flag]}.`);
+  }
+
+  if ('categories' in raw) {
+    if (!Array.isArray(raw.categories)) {
+      warn('categories must be an array — kept the previous list.');
+    } else {
+      const cats = [];
+      const seen = new Set();
+      raw.categories.forEach((c, i) => {
+        const at = `categories[${i}]`;
+        if (!c || typeof c !== 'object' || Array.isArray(c)) { warn(`${at} is not an object — dropped.`); return; }
+        if (!SS_SORT_MODES.some(m => m.id === c.modeId)) {
+          warn(`${at}: unknown modeId ${JSON.stringify(c.modeId)} — dropped.`); return;
+        }
+        if (seen.has(c.modeId)) { warn(`${at}: duplicate modeId "${c.modeId}" — dropped.`); return; }
+        seen.add(c.modeId);
+
+        let minTabs = _ssNormInt(c.minTabs, 1, 999);
+        if (minTabs === null) {
+          if ('minTabs' in c) warn(`${at} (${c.modeId}): minTabs must be a whole number >= 1 — used 1.`);
+          minTabs = 1;
+        }
+        let enabled = true;
+        if ('enabled' in c) {
+          if (typeof c.enabled === 'boolean') enabled = c.enabled;
+          else warn(`${at} (${c.modeId}): enabled must be true or false — used true.`);
+        }
+        let rule = null;   // null = inherit the global setting
+        if ('addEmptyPageWhen' in c) {
+          rule = _ssNormEmptyPageRule(c.addEmptyPageWhen);
+          if (rule === null) warn(`${at} (${c.modeId}): addEmptyPageWhen must be "never", "always" or a number 0-100 — inherited the global setting.`);
+        }
+        cats.push({ modeId: c.modeId, minTabs, enabled, addEmptyPageWhen: rule });
+      });
+      if (!cats.length) warn('categories had no usable entry — kept the previous list.');
+      else out.categories = cats;
+    }
+  }
+
+  return out;
+}
+
+// The user's saved override, straight from localStorage and unvalidated.
+// Storage can be blocked outright (private windows, hardened browsers), so
+// every access is wrapped — a failure just means "no override".
+function _ssAutoSortUserRaw() {
+  try {
+    const s = localStorage.getItem(SS_AUTOSORT_LS_KEY);
+    return s ? JSON.parse(s) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function _ssSetAutoSortUserConfig(raw) {
+  try {
+    if (raw === null) localStorage.removeItem(SS_AUTOSORT_LS_KEY);
+    else localStorage.setItem(SS_AUTOSORT_LS_KEY, JSON.stringify(raw, null, 2));
+  } catch (e) {
+    _ssAutoSortCache = null;
+    return e.message || String(e);
+  }
+  _ssAutoSortCache = null;
+  return null;
+}
+
+// Built-in → base file → user override. Memoised; every writer above clears
+// the cache.
+function _ssAutoSortConfig() {
+  if (_ssAutoSortCache) return _ssAutoSortCache;
+  const w = [];
+  let cfg = _ssMergeAutoSortConfig(SS_AUTOSORT_BUILTIN, _ssAutoSortBaseRaw, 'autosort.json', w);
+  cfg = _ssMergeAutoSortConfig(cfg, _ssAutoSortUserRaw(), L('ui_ss_auto_cfg_saved', 'saved settings'), w);
+  _ssAutoSortWarnings = w;
+  _ssAutoSortCache = cfg;
+  return cfg;
+}
+
+// The categories that will actually run, in order.
+function _ssAutoSortLayout() {
+  return _ssAutoSortConfig().categories.filter(c => c.enabled !== false);
+}
+
+// Same fixed grid every regular tab is rendered and planned against — see
+// _ssPlanSort's gridW/gridH.
+const SS_TAB_CELLS = 16 * 13;
+
+// How much of one tab's grid is occupied, 0-100. Socketed children ride inside
+// their parent's footprint, so only top-level stash items are counted.
+function _ssTabFillPct(physicalIdx) {
+  const tab = sharedStashParsed && sharedStashParsed.tabs[physicalIdx];
+  if (!tab) return 0;
+  let cells = 0;
+  for (const it of tab.items) {
+    if (it.parent !== 0 || it.storage !== 5) continue;
+    const { w, h } = getItemSize(it.typeCode);
+    cells += w * h;
+  }
+  return (cells / SS_TAB_CELLS) * 100;
+}
 
 // Step 0. Only empty tabs sitting BEHIND a sort's last target can be borrowed
 // (see _ssPrepareInPlaceSort's emptyPool), so an empty tab stranded in the
 // middle of the stash is dead weight the run cannot use. Sliding them all to
 // the end first is a pure tab reorder — no item bytes move — and it is what
 // keeps a stash with enough total room from failing halfway through.
-function _ssCompactEmptyTabsToEnd() {
+//
+// The first `startTab` slots are reserved and sit outside the layout entirely,
+// so they keep their exact contents and positions — an empty reserved tab is
+// not swept to the end, and a full one is not shuffled forward.
+function _ssCompactEmptyTabsToEnd(startTab) {
   const regular = _ssRegularTabIndices();
+  const held = regular.slice(0, startTab);
   const nonEmpty = [], empty = [];
-  for (const i of regular) {
+  for (const i of regular.slice(startTab)) {
     (sharedStashParsed.tabs[i].items.length ? nonEmpty : empty).push(i);
   }
-  const order = nonEmpty.concat(empty);
+  const order = held.concat(nonEmpty, empty);
   if (order.every((v, k) => v === regular[k])) return { ok: true, changed: false };
   return { ok: _ssReorderRegularTabs(order), changed: true };
 }
@@ -17742,16 +17946,26 @@ function _ssPlanSortedItemCount(plan) {
   return n;
 }
 
-// Runs the layout top to bottom. Returns { steps, failed }, where failed is
-// null on a clean run and otherwise names the step that stopped it. Every
-// mutation is already committed by the time this returns — the caller only
-// reports.
+// Runs the layout top to bottom. Returns { steps, failed, failures }, where
+// failed is null on a clean run and otherwise names the step that STOPPED the
+// run; failures lists every step that went wrong, which is only ever more than
+// one when continueOnFailure is set. Every mutation is already committed by
+// the time this returns — the caller only reports.
 function _ssRunAutoSort() {
+  const cfg = _ssAutoSortConfig();
+  const layout = _ssAutoSortLayout();
   const steps = [];
+  const failures = [];
+
+  // Reserved tabs can't be reserved if they don't exist. Clamping rather than
+  // failing keeps a stale startTab from bricking the button on a small stash.
+  const startTab = Math.min(cfg.startTab, _ssRegularTabIndices().length);
 
   const backup0 = sharedStashData.slice();
   try {
-    const compact = _ssCompactEmptyTabsToEnd();
+    const compact = cfg.compactEmptyTabsFirst
+      ? _ssCompactEmptyTabsToEnd(startTab)
+      : { ok: true, changed: false };
     if (!compact.ok) throw new Error('tab reorder failed');
     if (compact.changed) {
       if (_ssChainOkAtLoad) {
@@ -17766,26 +17980,40 @@ function _ssRunAutoSort() {
     parseSharedStash();
     renderSharedStashTabs();
     console.error('Auto sort compaction rolled back:', e);
-    return { steps, failed: { n: 0, label: L('ui_ss_auto_step_compact', 'Move empty tabs to the end'),
-                              reason: 'reverted', detail: e.message } };
+    const f = { n: 0, label: L('ui_ss_auto_step_compact', 'Move empty tabs to the end'),
+                reason: 'reverted', detail: e.message };
+    return { steps, failures: [f], failed: f, startTab };
   }
 
   // Slot position (index into _ssRegularTabIndices()) the next category starts
   // at. Re-resolved to physical indices every step, because a borrowed tab
-  // moving into place renumbers everything behind it.
-  let cursor = 0;
+  // moving into place renumbers everything behind it. Starts past the
+  // reserved tabs, which the layout never touches.
+  let cursor = startTab;
   // Where each category ended up, for the padding pass below: `end` is the
   // slot just past its run, `tabs` how many slots it took.
   const spans = [];
 
-  for (let k = 0; k < SS_AUTO_LAYOUT.length; k++) {
-    const spec = SS_AUTO_LAYOUT[k];
+  // A step that failed reserved nothing and changed nothing (each one rolls
+  // itself back), so the cursor is still valid and the next category can go
+  // ahead from the same place.
+  const stop = (f) => {
+    failures.push(f);
+    return cfg.continueOnFailure ? null : { steps, failures, failed: f, startTab };
+  };
+
+  for (let k = 0; k < layout.length; k++) {
+    const spec = layout[k];
     const mode = _ssSortMode(spec.modeId);
     const stepInfo = { n: k + 1, label: mode.label(), items: 0, tabs: 0 };
     const regular = _ssRegularTabIndices();
 
     if (cursor >= regular.length) {
-      return { steps, failed: { ...stepInfo, reason: 'noSlots' } };
+      const halt = stop({ ...stepInfo, reason: 'noSlots' });
+      if (halt) return halt;
+      steps.push({ ...stepInfo, failed: true, reason: 'noSlots' });
+      spans.push({ spec, mode, tabs: 0, end: cursor });
+      continue;
     }
     // The category's WHOLE quota, not just the tabs its items will fill. Every
     // one of them is a target, so every one gets emptied out, and the planner
@@ -17796,7 +18024,10 @@ function _ssRunAutoSort() {
     // picks that up along with the categories that had nothing to sort.
     const dests = regular.slice(cursor, cursor + spec.minTabs);
 
-    const res = _ssPrepareInPlaceSort(mode, regular, dests);
+    // Reserved tabs are not sources either: an item of this category sitting
+    // in one must be left exactly where the user put it, not dragged into the
+    // layout.
+    const res = _ssPrepareInPlaceSort(mode, regular.slice(startTab), dests);
 
     // Nothing of this category anywhere in the stash, so there is nothing to
     // sort and no target tabs get reserved. Its quota is not forfeited — the
@@ -17808,12 +18039,20 @@ function _ssRunAutoSort() {
       continue;
     }
     if (res.error) {
-      return { steps, failed: { ...stepInfo, reason: res.error, borrowed: res.borrowed } };
+      const halt = stop({ ...stepInfo, reason: res.error, borrowed: res.borrowed });
+      if (halt) return halt;
+      steps.push({ ...stepInfo, failed: true, reason: res.error });
+      spans.push({ spec, mode, tabs: 0, end: cursor });
+      continue;
     }
 
     const applied = _ssApplyInPlaceSort(res, { keepStraysAtEnd: true });
     if (applied.error) {
-      return { steps, failed: { ...stepInfo, reason: 'reverted', detail: applied.detail } };
+      const halt = stop({ ...stepInfo, reason: 'reverted', detail: applied.detail });
+      if (halt) return halt;
+      steps.push({ ...stepInfo, failed: true, reason: 'reverted' });
+      spans.push({ spec, mode, tabs: 0, end: cursor });
+      continue;
     }
 
     const span = dests.length + res.sortExtras.length;
@@ -17850,7 +18089,7 @@ function _ssRunAutoSort() {
   }
   for (let k = 0; k < steps.length; k++) steps[k].tabs += padding.added[k];
 
-  return { steps, padding, failed: null };
+  return { steps, padding, failures, failed: null, startTab };
 }
 
 // Hands every category that came up short of its quota the tabs it is owed,
@@ -17864,23 +18103,74 @@ function _ssRunAutoSort() {
 // with no items to sort (which reserved nothing) or one whose quota ran past
 // the last tab in the stash; a category that sorted normally already holds its
 // whole quota, blank tabs included, and asks for nothing here.
+//
+// Two passes, in that order. The first settles the quotas above, which are a
+// promise the layout made. Only then does the second hand out the optional
+// breathing page (addEmptyPageWhen) — running short of those is not a
+// failure, it just means the stash is full, whereas a quota left unmet is
+// worth telling the user about.
 function _ssPadAutoLayout(spans) {
+  const cfg = _ssAutoSortConfig();
   const deficit = spans.map(s => Math.max(0, s.spec.minTabs - s.tabs));
   const added = spans.map(() => 0);
+  // Every category disabled: there is no layout to pad, and _ssInsertPaddingTab
+  // would have no last span to read a tail position from.
+  if (!spans.length) return { added, short: deficit, exhausted: false, total: 0, breathers: [] };
 
+  // Pass 1 — quota shortfall.
   let exhausted = false;
-  while (!exhausted) {
+  if (cfg.padding !== 'off') {
+    exhausted = _ssHandOutPaddingTabs(spans, deficit, added, cfg.padding === 'roundRobin');
+  }
+
+  // Pass 2 — one breathing page per category that wants one. Evaluated here
+  // rather than earlier because pass 1 can have just handed a category a
+  // blank tab, which is exactly the headroom this pass exists to create.
+  const want = spans.map((s, k) => _ssWantsEmptyPage(spans, k, added[k], cfg) ? 1 : 0);
+  const breathers = want.slice();
+  _ssHandOutPaddingTabs(spans, want, added, true);
+
+  return { added, short: deficit, exhausted, total: added.reduce((a, b) => a + b, 0),
+           breathers: breathers.map((n, k) => n - want[k]) };
+}
+
+// True when category k's run ends in a tab too full to be comfortable. The
+// measure is the LAST tab of the run only: if it still has room, the category
+// has somewhere to put the next item it picks up and needs nothing.
+function _ssWantsEmptyPage(spans, k, addedK, cfg) {
+  const rule = spans[k].spec.addEmptyPageWhen === null
+    ? cfg.addEmptyPageWhen
+    : spans[k].spec.addEmptyPageWhen;
+  if (rule === 'never') return false;
+
+  // A category that sorted nothing and got no padding has no run, so there is
+  // no last tab to measure and nothing to give it breathing room around.
+  if (spans[k].tabs + addedK <= 0) return false;
+
+  const regular = _ssRegularTabIndices();
+  const lastPos = spans[k].end - 1;
+  if (lastPos < 0 || lastPos >= regular.length) return false;
+  return _ssTabFillPct(regular[lastPos]) > rule;
+}
+
+// Hands out tabs against `need`, decrementing it and counting into `added`.
+// Round-robin gives each category one per pass so a shortage is shared out;
+// otherwise each category is filled completely before the next gets a look in.
+// Returns true if it ran out of empty tabs before `need` was satisfied.
+function _ssHandOutPaddingTabs(spans, need, added, roundRobin) {
+  while (true) {
     let handedOut = 0;
     for (let k = 0; k < spans.length; k++) {
-      if (deficit[k] <= 0) continue;
-      if (!_ssInsertPaddingTab(spans, k)) { exhausted = true; break; }
-      deficit[k]--;
-      added[k]++;
-      handedOut++;
+      while (need[k] > 0) {
+        if (!_ssInsertPaddingTab(spans, k)) return true;   // stash is out of empty tabs
+        need[k]--;
+        added[k]++;
+        handedOut++;
+        if (roundRobin) break;
+      }
     }
-    if (!handedOut) break;      // every quota met
+    if (!handedOut) return false;   // everything asked for has been given
   }
-  return { added, short: deficit, exhausted, total: added.reduce((a, b) => a + b, 0) };
 }
 
 // Slides one empty tab from behind the whole layout into the slot just past
@@ -17935,26 +18225,38 @@ window.ssAutoSortRun = function() {
     return;
   }
 
+  const cfg = _ssAutoSortConfig();
+  const layout = _ssAutoSortLayout();
+  if (!layout.length) {
+    showPopup(L('ui_ss_auto_no_categories',
+      'Every category is turned off in the Auto Sort settings, so there is nothing to sort.'));
+    return;
+  }
+
   // Slot numbers as the layout would come out with no overflow at all — the
   // shape the user asked for, and what they see if every category fits.
-  let slot = 1;
-  const lines = SS_AUTO_LAYOUT.map(spec => {
+  let slot = cfg.startTab + 1;
+  const lines = layout.map(spec => {
     const mode = _ssSortMode(spec.modeId);
     const from = slot, to = slot + spec.minTabs - 1;
     slot = to + 1;
-    const span = (spec === SS_AUTO_LAYOUT[SS_AUTO_LAYOUT.length - 1])
+    const span = (spec === layout[layout.length - 1])
       ? Lfmt('ui_ss_auto_tab_onwards', 'Tab {from}+', { from })
       : (from === to ? Lfmt('ui_ss_auto_tab_one', 'Tab {n}', { n: from })
                      : Lfmt('ui_ss_auto_tab_range', 'Tabs {from}-{to}', { from, to }));
     return `${span}: ${mode.label()}`;
   });
+  if (cfg.startTab > 0) {
+    lines.unshift(Lfmt('ui_ss_auto_reserved_line',
+      'Tabs 1-{n}: left untouched (startTab)', { n: cfg.startTab }));
+  }
 
   const msg = L('ui_ss_auto_confirm_intro', 'Rearrange the whole shared stash into this layout?')
     + '\n\n' + lines.join('\n') + '\n\n'
     + L('ui_ss_auto_confirm_note',
         'Empty tabs are moved to the end first. A category with more items than its tabs hold borrows empty tabs and pushes everything after it along; one with fewer leaves the rest of its tabs empty. A category you own nothing of is sorted last of all: once everything else is settled it is handed its blank tabs one at a time, sharing whatever empty tabs are left with the other empty categories. Items no category claims are swept to tabs at the very end and left unsorted. Each step commits on its own — if one fails it rolls itself back and the run stops there, keeping the steps before it.');
 
-  showConfirm(msg, () => {
+  const go = () => {
     const run = _ssRunAutoSort();
     const items = run.steps.reduce((s, x) => s + x.items, 0);
     const tabs = run.steps.reduce((s, x) => s + x.tabs, 0);
@@ -17974,6 +18276,13 @@ window.ssAutoSortRun = function() {
       out += '\n\n' + Lfmt('ui_ss_auto_skipped', 'Nothing found for: {list} — their tabs were left blank.',
         { list: skipped.map(s => s.label).join(', ') });
     }
+    // With continueOnFailure the run keeps going past a bad step, so the
+    // headline above describes a completed run and these are the casualties.
+    if (!run.failed && run.failures && run.failures.length) {
+      out += '\n\n' + Lfmt('ui_ss_auto_failed_steps',
+        'Skipped after failing (nothing from them was applied):\n{list}',
+        { list: run.failures.map(f => `${f.label} — ${_ssAutoSortFailureText(f)}`).join('\n') });
+    }
     const pad = run.padding;
     if (pad && pad.short.some(n => n > 0)) {
       const list = run.steps
@@ -17989,7 +18298,143 @@ window.ssAutoSortRun = function() {
         { detail: pad.error });
     }
     showPopup(out);
-  }, L('ui_ss_auto_confirm_btn', 'Auto Sort'));
+  };
+
+  if (cfg.skipConfirm) go();
+  else showConfirm(msg, go, L('ui_ss_auto_confirm_btn', 'Auto Sort'));
+};
+
+// ── Auto Sort settings ──
+// A plain JSON editor over the three-layer config. Apply writes the text to
+// localStorage as the user override; Reset drops the override and falls back
+// to base/autosort.json. The dialog never sorts anything — the user closes it
+// and presses Auto Sort when they are ready.
+
+// The effective config, shaped the way the JSON file is written: category
+// entries carry addEmptyPageWhen only when they actually override the global.
+function _ssAutoSortConfigJson() {
+  const cfg = _ssAutoSortConfig();
+  const unrule = (r) => (r === 0 ? 'always' : r);
+  return JSON.stringify({
+    version: cfg.version,
+    startTab: cfg.startTab,
+    compactEmptyTabsFirst: cfg.compactEmptyTabsFirst,
+    padding: cfg.padding,
+    addEmptyPageWhen: unrule(cfg.addEmptyPageWhen),
+    continueOnFailure: cfg.continueOnFailure,
+    skipConfirm: cfg.skipConfirm,
+    categories: cfg.categories.map(c => {
+      const o = { modeId: c.modeId, minTabs: c.minTabs, enabled: c.enabled };
+      if (c.addEmptyPageWhen !== null) o.addEmptyPageWhen = unrule(c.addEmptyPageWhen);
+      return o;
+    }),
+  }, null, 2);
+}
+
+window.openAutoSortSettings = function() {
+  const modeList = SS_SORT_MODES.map(m => m.id).join(', ');
+  const hasOverride = _ssAutoSortUserRaw() !== null;
+
+  const bodyHtml = `
+    <div style="color:var(--d2-text-dim);font-size:12px;line-height:1.5;margin-bottom:8px">
+      ${esc(L('ui_ss_auto_cfg_help', 'Order of the categories list is the tab order. addEmptyPageWhen takes "never", "always" or a number 0-100 — the fill percentage of a category\'s last tab above which it is given one more empty tab.'))}
+    </div>
+    <div style="color:var(--d2-text-dim);font-size:11px;line-height:1.5;margin-bottom:10px">
+      ${esc(L('ui_ss_auto_cfg_modes', 'Valid modeId values:'))} ${esc(modeList)}
+    </div>
+    <textarea id="ssAutoCfgText" spellcheck="false"
+      style="width:100%;height:300px;box-sizing:border-box;background:var(--d2-surface2);color:var(--d2-text);border:1px solid var(--d2-border);padding:8px 10px;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.45;outline:none;resize:vertical"></textarea>
+    <div id="ssAutoCfgStatus" style="min-height:18px;font-size:12px;line-height:1.5;margin-top:8px;text-align:left;white-space:pre-line"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-start;flex-wrap:wrap;margin-top:10px">
+      <button type="button" class="btn" id="ssAutoCfgReset" style="margin:0">${esc(L('ui_ss_auto_cfg_reset', 'Reset to default'))}</button>
+      <button type="button" class="btn" id="ssAutoCfgExport" style="margin:0">${esc(L('ui_ss_auto_cfg_export', 'Export'))}</button>
+      <button type="button" class="btn" id="ssAutoCfgImport" style="margin:0">${esc(L('ui_ss_auto_cfg_import', 'Import'))}</button>
+      <input type="file" id="ssAutoCfgFile" accept="application/json,.json" style="display:none">
+    </div>`;
+
+  const close = showDialog({
+    title: L('ui_ss_auto_cfg_title', 'Auto Sort Settings'),
+    bodyHtml,
+    maxWidth: '640px',
+    buttons: [
+      { label: L('ui_ss_auto_cfg_apply', 'Apply'), tone: 'success', onClick: () => _ssApplyAutoSortSettings() },
+      { label: L('ui_btn_close', 'Close'), tone: 'primary' },
+    ],
+  });
+
+  const overlay = document.getElementById('sharedDialogOverlay');
+  const ta     = overlay.querySelector('#ssAutoCfgText');
+  const status = overlay.querySelector('#ssAutoCfgStatus');
+  const file   = overlay.querySelector('#ssAutoCfgFile');
+  ta.value = _ssAutoSortConfigJson();
+
+  const say = (msg, tone) => {
+    status.textContent = msg;
+    status.style.color = tone === 'bad' ? 'var(--d2-red)' : (tone === 'warn' ? 'var(--d2-gold-dim)' : 'var(--d2-text-dim)');
+  };
+  if (hasOverride) say(L('ui_ss_auto_cfg_overridden', 'Showing your saved settings. Reset drops them and goes back to the bundled defaults.'));
+  else say(L('ui_ss_auto_cfg_defaults', 'Showing the bundled defaults. Apply saves your edits to this browser only.'));
+
+  // showDialog closes the overlay before running onClick, so the textarea is
+  // gone by then — mirror its contents into `text` as they are typed.
+  let text = ta.value;
+  ta.addEventListener('input', () => { text = ta.value; });
+
+  function _ssApplyAutoSortSettings() {
+    let raw;
+    try {
+      raw = JSON.parse(text);
+    } catch (e) {
+      showPopup(Lfmt('ui_ss_auto_cfg_badjson', 'That is not valid JSON, so nothing was saved.\n\n{detail}', { detail: e.message }));
+      return;
+    }
+    const warnings = [];
+    _ssMergeAutoSortConfig(SS_AUTOSORT_BUILTIN, raw, L('ui_ss_auto_cfg_saved', 'saved settings'), warnings);
+    const err = _ssSetAutoSortUserConfig(raw);
+    if (err) {
+      showPopup(Lfmt('ui_ss_auto_cfg_nostore', 'Could not save to this browser\'s storage. ({detail})', { detail: err }));
+      return;
+    }
+    let out = L('ui_ss_auto_cfg_saved_ok', 'Saved. The next Auto Sort run uses these settings.');
+    if (warnings.length) {
+      out += '\n\n' + L('ui_ss_auto_cfg_warned', 'Some fields were not usable and fell back to the defaults:') +
+             '\n' + warnings.map(w => '• ' + w).join('\n');
+    }
+    showPopup(out);
+  }
+
+  overlay.querySelector('#ssAutoCfgReset').addEventListener('click', () => {
+    _ssSetAutoSortUserConfig(null);
+    ta.value = _ssAutoSortConfigJson();
+    text = ta.value;
+    say(L('ui_ss_auto_cfg_was_reset', 'Saved settings cleared — back to the bundled defaults.'));
+  });
+
+  overlay.querySelector('#ssAutoCfgExport').addEventListener('click', () => {
+    const blob = new Blob([ta.value], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'autosort.json'; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+
+  overlay.querySelector('#ssAutoCfgImport').addEventListener('click', () => file.click());
+  file.addEventListener('change', () => {
+    const f = file.files && file.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      // Loaded into the box only — the user still has to press Apply, so a
+      // file that turns out to be wrong costs nothing.
+      ta.value = String(reader.result || '');
+      text = ta.value;
+      say(Lfmt('ui_ss_auto_cfg_imported', 'Loaded {name}. Press Apply to save it.', { name: f.name }));
+    };
+    reader.onerror = () => say(L('ui_ss_auto_cfg_readfail', 'Could not read that file.'), 'bad');
+    reader.readAsText(f);
+  });
+
+  return close;
 };
 
 // ── Sort Items modal ──
@@ -18402,6 +18847,7 @@ function renderSharedStashTabs() {
         + `</button>`;
   html += `<button type="button" class="btn" style="margin:0" onclick="openSortItemsModal()">${esc(L('ui_ss_sort_btn2', 'Sort Items'))}</button>`;
   html += `<button type="button" class="btn" style="margin:0" title="${esc(L('ui_ss_auto_sort_tip', 'Sort every category into a fixed stash layout in one go.'))}" onclick="ssAutoSortRun()">${esc(L('ui_ss_auto_sort_btn', 'Auto Sort'))}</button>`;
+  html += `<button type="button" class="btn" style="margin:0;padding-left:10px;padding-right:10px" title="${esc(L('ui_ss_auto_cfg_tip', 'Edit the Auto Sort layout and behaviour.'))}" onclick="openAutoSortSettings()">⚙</button>`;
   html += `</div>`;
   // The last empty regular tab is what an "insert empty tab" borrows; with
   // none left the + buttons are disabled rather than failing on click.
