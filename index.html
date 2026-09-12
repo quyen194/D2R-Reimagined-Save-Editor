@@ -16828,13 +16828,33 @@ function _ssIsGearItem(item) {
   return !!ITEM_TYPE_BY_CODE[item.typeCode || ''];
 }
 
+// The bucket order actually in force. SS_GEAR_GROUPS above is the default;
+// autosort.json's `gearGroups` may list keys to pull to the front, and
+// anything it leaves out keeps its built-in place behind them. Memoised
+// against the config, which _ssAutoSortCache invalidation resets.
+let _ssGearGroupsCache = null;
+function _ssGearGroups() {
+  if (_ssGearGroupsCache) return _ssGearGroupsCache;
+  const order = _ssAutoSortConfig().gearGroups;
+  if (!order || !order.length) return (_ssGearGroupsCache = SS_GEAR_GROUPS);
+  const byKey = new Map(SS_GEAR_GROUPS.map(g => [g.key, g]));
+  const front = [];
+  for (const k of order) {
+    const g = byKey.get(k);
+    if (g && !front.includes(g)) front.push(g);
+  }
+  _ssGearGroupsCache = front.concat(SS_GEAR_GROUPS.filter(g => !front.includes(g)));
+  return _ssGearGroupsCache;
+}
+
 // Bucket index used as the primary gear sort key. Anything typed but
 // unmatched (an oddball mod type) sorts after every named bucket.
 function _ssGearGroupIndex(item) {
-  for (let i = 0; i < SS_GEAR_GROUPS.length; i++) {
-    if (_ssTypeChainHas(item, SS_GEAR_GROUPS[i].types)) return i;
+  const groups = _ssGearGroups();
+  for (let i = 0; i < groups.length; i++) {
+    if (_ssTypeChainHas(item, groups[i].types)) return i;
   }
-  return SS_GEAR_GROUPS.length;
+  return groups.length;
 }
 
 // Coarser key that runs AHEAD of the bucket index: all armor first, then every
@@ -16844,7 +16864,7 @@ function _ssGearGroupIndex(item) {
 // hand at all but ride along with the launcher they feed, hence the explicit 2.
 // Anything typed but unbucketed stays dead last, as it did before.
 function _ssHandTier(item) {
-  const group = SS_GEAR_GROUPS[_ssGearGroupIndex(item)];
+  const group = _ssGearGroups()[_ssGearGroupIndex(item)];
   if (!group) return 3;
   if (group.slot === 'armor') return 0;
   if (IS_2HANDED.has(item.typeCode || '')) return 2;
@@ -16895,12 +16915,35 @@ function _ssItemSortLevel(item) {
 // Crafted (q=8) sorts ahead of unique (q=7) inside each group.
 function _ssQualityRank(item) { return item.quality === 8 ? 0 : 1; }
 
-// Item level, negated so a plain ascending comparison puts the HIGHEST ilvl
-// first. Used as the tie-break whenever two items need the same level to
-// equip: same requirement, better roll potential goes on top.
-function _ssIlvlDesc(item) { return -(item.itemLevel || 0); }
+// Item level is the tie-break whenever two items need the same level to
+// equip: same requirement, better roll potential goes on top. The "highest
+// first" part is the "-ilvl" direction in each mode's sortKeys.
 
 function _ssBaseName(item) { return itemNameFromCode(item.typeCode || ''); }
+
+// ── Sort key registry ───────────────────────────────────────
+// The names autosort.json's `sortKeys` may use. A name prefixed with "-"
+// sorts descending, which is how the defaults ask for "highest ilvl first"
+// and "grand charms before small". Every entry returns a number or a string;
+// nothing here reads the item's property list, which desyncs too often to
+// sort on (see _ssItemTrueLength).
+const SS_SORT_KEY_FNS = {
+  handTier:  _ssHandTier,
+  gearGroup: _ssGearGroupIndex,
+  quality:   _ssQualityRank,
+  reqLevel:  _ssItemSortLevel,
+  ilvl:      (it) => it.itemLevel || 0,
+  height:    (it) => getItemSize(it.typeCode).h,
+  baseName:  _ssBaseName,
+};
+
+// ["handTier", "-ilvl"] → { key(item) -> [...], dirs: ['asc','desc'] }.
+// Unknown names are the validator's problem; by here the list is clean.
+function _ssBuildSortKey(names) {
+  const fns  = names.map(n => SS_SORT_KEY_FNS[n.replace(/^-/, '')]);
+  const dirs = names.map(n => (n.charAt(0) === '-' ? 'desc' : 'asc'));
+  return { key: (it) => fns.map(f => f(it)), dirs };
+}
 
 // Crafted rides with unique rather than with rare: both are one-off drops the
 // user hoards, and crafted takes the front of the pair via _ssQualityRank.
@@ -16926,7 +16969,9 @@ const SS_SORT_MODES = [
     hint:  () => L('ui_ss_mode_set_hint', 'Groups every piece of a set together, sets in alphabetical order.'),
     noun:  () => L('ui_ss_noun_set', 'set items'),
     atomicSets: true,
-    streams: [{ match: (it) => it.quality === 5, dir: 'row', key: () => [0] }],
+    // No sortKeys: the order here comes from grouping whole sets together,
+    // not from any per-item key, so there is nothing for a config to reorder.
+    streams: [{ id: 'main', match: (it) => it.quality === 5, dir: 'row', key: () => [0] }],
   },
   {
     id: 'uniqueGear',
@@ -16934,10 +16979,10 @@ const SS_SORT_MODES = [
     hint:  () => L('ui_ss_mode_gear_hint', 'By slot (helm, armor, belt, gloves, boots, shield, one-handed then two-handed weapons), then required level.'),
     noun:  () => L('ui_ss_noun_unique', 'crafted & unique items'),
     streams: [{
+      id: 'main',
       match: (it) => _ssIsUniqueLike(it) && _ssIsGearItem(it),
       dir: 'row',
-      key: (it) => [_ssHandTier(it), _ssGearGroupIndex(it), _ssQualityRank(it),
-                    _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+      sortKeys: ['handTier', 'gearGroup', 'quality', 'reqLevel', '-ilvl', 'baseName'],
     }],
   },
   {
@@ -16946,10 +16991,10 @@ const SS_SORT_MODES = [
     hint:  () => L('ui_ss_mode_gear_hint', 'By slot (helm, armor, belt, gloves, boots, shield, one-handed then two-handed weapons), then required level.'),
     noun:  () => L('ui_ss_noun_rare', 'rare items'),
     streams: [{
+      id: 'main',
       match: (it) => _ssIsRare(it) && _ssIsGearItem(it),
       dir: 'row',
-      key: (it) => [_ssHandTier(it), _ssGearGroupIndex(it), _ssItemSortLevel(it),
-                    _ssIlvlDesc(it), _ssBaseName(it)],
+      sortKeys: ['handTier', 'gearGroup', 'reqLevel', '-ilvl', 'baseName'],
     }],
   },
   {
@@ -16958,10 +17003,10 @@ const SS_SORT_MODES = [
     hint:  () => L('ui_ss_mode_charm_hint', 'Grand charms first, then large, then small — each by required level.'),
     noun:  () => L('ui_ss_noun_unique_charm', 'crafted & unique charms'),
     streams: [{
+      id: 'main',
       match: (it) => _ssIsUniqueLike(it) && _ssTypeChainHas(it, ['char', 'torc']),
       dir: 'row',
-      key: (it) => [-getItemSize(it.typeCode).h, _ssQualityRank(it),
-                    _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+      sortKeys: ['-height', 'quality', 'reqLevel', '-ilvl', 'baseName'],
     }],
   },
   {
@@ -16970,9 +17015,10 @@ const SS_SORT_MODES = [
     hint:  () => L('ui_ss_mode_charm_hint', 'Grand charms first, then large, then small — each by required level.'),
     noun:  () => L('ui_ss_noun_magic_charm', 'magic charms'),
     streams: [{
+      id: 'main',
       match: (it) => it.quality === 4 && _ssTypeChainHas(it, ['char', 'torc']),
       dir: 'row',
-      key: (it) => [-getItemSize(it.typeCode).h, _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+      sortKeys: ['-height', 'reqLevel', '-ilvl', 'baseName'],
     }],
   },
   {
@@ -16981,9 +17027,10 @@ const SS_SORT_MODES = [
     hint:  () => L('ui_ss_mode_jewel_hint', 'By required level.'),
     noun:  () => L('ui_ss_noun_unique_jewel', 'crafted & unique jewels'),
     streams: [{
+      id: 'main',
       match: (it) => _ssIsUniqueLike(it) && _ssTypeChainHas(it, ['jewl']),
       dir: 'row',
-      key: (it) => [_ssQualityRank(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+      sortKeys: ['quality', 'reqLevel', '-ilvl', 'baseName'],
     }],
   },
   {
@@ -16993,14 +17040,16 @@ const SS_SORT_MODES = [
     noun:  () => L('ui_ss_noun_rare_magic_jewel', 'rare/magic jewels'),
     streams: [
       {
+        id: 'rare',
         match: (it) => _ssIsRare(it) && _ssTypeChainHas(it, ['jewl']),
         dir: 'colL',
-        key: (it) => [_ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+        sortKeys: ['reqLevel', '-ilvl', 'baseName'],
       },
       {
+        id: 'magic',
         match: (it) => it.quality === 4 && _ssTypeChainHas(it, ['jewl']),
         dir: 'colR',
-        key: (it) => [_ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)],
+        sortKeys: ['reqLevel', '-ilvl', 'baseName'],
       },
     ],
   },
@@ -17021,30 +17070,57 @@ function _ssRingAmuletModes() {
       nounKey: 'ui_ss_noun_magic_ringamu', nounDef: 'magic rings & amulets',
       match: (it) => it.quality === 4, ranked: false },
   ];
-  return defs.map(d => ({
-    id: d.id,
-    label: () => L(d.labelKey, d.labelDef),
-    hint:  () => L('ui_ss_mode_ringamu_hint', 'Rings fill columns from the left, amulets from the right — both by required level.'),
-    noun:  () => L(d.nounKey, d.nounDef),
-    streams: [
-      {
-        match: (it) => d.match(it) && _ssTypeChainHas(it, ['ring']),
-        dir: 'colL',
-        key: (it) => (d.ranked ? [_ssQualityRank(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)]
-                               : [_ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)]),
-      },
-      {
-        match: (it) => d.match(it) && _ssTypeChainHas(it, ['amul']),
-        dir: 'colR',
-        key: (it) => (d.ranked ? [_ssQualityRank(it), _ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)]
-                               : [_ssItemSortLevel(it), _ssIlvlDesc(it), _ssBaseName(it)]),
-      },
-    ],
-  }));
+  return defs.map(d => {
+    // Only the unique tier holds two qualities (crafted and unique), so only
+    // it needs a quality key to separate them.
+    const keys = d.ranked ? ['quality', 'reqLevel', '-ilvl', 'baseName']
+                          : ['reqLevel', '-ilvl', 'baseName'];
+    return {
+      id: d.id,
+      label: () => L(d.labelKey, d.labelDef),
+      hint:  () => L('ui_ss_mode_ringamu_hint', 'Rings fill columns from the left, amulets from the right — both by required level.'),
+      noun:  () => L(d.nounKey, d.nounDef),
+      streams: [
+        { id: 'ring', match: (it) => d.match(it) && _ssTypeChainHas(it, ['ring']), dir: 'colL', sortKeys: keys },
+        { id: 'amul', match: (it) => d.match(it) && _ssTypeChainHas(it, ['amul']), dir: 'colR', sortKeys: keys },
+      ],
+    };
+  });
+}
+
+// Modes with the config's sortKeys / fill applied, built once per config and
+// thrown away whenever the config changes. Every caller goes through
+// _ssSortMode, so the manual Sort Items modal honours the same settings the
+// auto sort does — one category, one definition of how it sorts.
+let _ssResolvedModes = null;
+
+function _ssResolveSortModes() {
+  if (_ssResolvedModes) return _ssResolvedModes;
+  const cfg = _ssAutoSortConfig();
+  const byId = new Map(cfg.categories.map(c => [c.modeId, c]));
+
+  _ssResolvedModes = SS_SORT_MODES.map(mode => {
+    const spec = byId.get(mode.id);
+    const streams = mode.streams.map(st => {
+      const out = { ...st };
+      if (st.sortKeys) {
+        const names = (spec && spec.sortKeys) ? spec.sortKeys : st.sortKeys;
+        const built = _ssBuildSortKey(names);
+        out.key = built.key;
+        out.keyDirs = built.dirs;
+      }
+      const fill = spec && spec.fill && spec.fill[st.id];
+      if (fill) out.dir = fill;
+      return out;
+    });
+    return { ...mode, streams };
+  });
+  return _ssResolvedModes;
 }
 
 function _ssSortMode(id) {
-  return SS_SORT_MODES.find(m => m.id === id) || SS_SORT_MODES[0];
+  const modes = _ssResolveSortModes();
+  return modes.find(m => m.id === id) || modes[0];
 }
 
 // Does any of the mode's streams claim this item?
@@ -17053,17 +17129,21 @@ function _ssModeMatches(mode, item) {
   return false;
 }
 
-function _ssCompareKeys(a, b) {
+// `dirs`, when given, flips individual positions to descending. A missing key
+// still sorts first regardless of direction — that is about the key being
+// absent, not about where its value belongs.
+function _ssCompareKeys(a, b, dirs) {
   for (let i = 0; i < Math.max(a.length, b.length); i++) {
     const x = a[i], y = b[i];
     if (x === y) continue;
     if (x === undefined) return -1;
     if (y === undefined) return 1;
+    const d = (dirs && dirs[i] === 'desc') ? -1 : 1;
     if (typeof x === 'string' || typeof y === 'string') {
       const c = String(x).localeCompare(String(y), undefined, { sensitivity: 'base' });
-      if (c) return c;
-    } else if (x < y) return -1;
-    else if (x > y) return 1;
+      if (c) return c * d;
+    } else if (x < y) return -d;
+    else if (x > y) return d;
   }
   return 0;
 }
@@ -17265,7 +17345,7 @@ function _ssPlanSort(sourceIdxs, targetOrder, mode, strayOrder) {
     for (let si = 0; si < mode.streams.length; si++) {
       const stream = mode.streams[si];
       const items = moveItems.filter(mi => mi.streamIdx === si)
-                             .sort((a, b) => _ssCompareKeys(a.sortKey, b.sortKey));
+                             .sort((a, b) => _ssCompareKeys(a.sortKey, b.sortKey, stream.keyDirs));
       if (!items.length) continue;
       const order = _ssScanOrder(stream.dir, gridW, gridH);
       const cursors = new Map(targetOrder.map(idx => [idx, { i: 0 }]));
@@ -17722,6 +17802,7 @@ function _ssApplyInPlaceSort(res, opts) {
 const SS_AUTOSORT_SCHEMA_VERSION = 1;
 const SS_AUTOSORT_LS_KEY = 'd2rse_ss_autosort_cfg';
 const SS_AUTOSORT_PADDING_MODES = ['roundRobin', 'inOrder', 'off'];
+const SS_FILL_DIRS = ['row', 'colL', 'colR'];
 
 // modeId must name a mode in SS_SORT_MODES. minTabs is the run of slots the
 // category reserves before any overflow borrowing. addEmptyPageWhen is null
@@ -17734,27 +17815,42 @@ const SS_AUTOSORT_BUILTIN = {
   addEmptyPageWhen: 30,
   continueOnFailure: false,
   skipConfirm: false,
+  gearGroups: null,        // null = SS_GEAR_GROUPS' own order
+  activeProfile: null,
+  profiles: {
+    compact:  { addEmptyPageWhen: 'never',  padding: 'off' },
+    spacious: { addEmptyPageWhen: 'always', padding: 'roundRobin' },
+  },
   categories: [
-    { modeId: 'uniqueGear',     minTabs: 5, enabled: true, addEmptyPageWhen: null },      // tabs 1-5
-    { modeId: 'uniqueRingAmu',  minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 6
-    { modeId: 'rareRingAmu',    minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 7
-    { modeId: 'magicRingAmu',   minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 8
-    { modeId: 'uniqueCharm',    minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 9
-    { modeId: 'magicCharm',     minTabs: 2, enabled: true, addEmptyPageWhen: null },      // tabs 10-11
-    { modeId: 'uniqueJewel',    minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 12
-    { modeId: 'rareMagicJewel', minTabs: 1, enabled: true, addEmptyPageWhen: null },      // tab 13
-    { modeId: 'set',            minTabs: 6, enabled: true, addEmptyPageWhen: 0 },         // tabs 14-19
-    { modeId: 'rareGear',       minTabs: 1, enabled: true, addEmptyPageWhen: 'never' },   // tab 20 onwards
+    { modeId: 'uniqueGear',     minTabs: 5, enabled: true, addEmptyPageWhen: null, sortKeys: null, fill: null },      // tabs 1-5
+    { modeId: 'uniqueRingAmu',  minTabs: 1, enabled: true, addEmptyPageWhen: null, sortKeys: null, fill: null },      // tab 6
+    { modeId: 'rareRingAmu',    minTabs: 1, enabled: true, addEmptyPageWhen: null, sortKeys: null, fill: null },      // tab 7
+    { modeId: 'magicRingAmu',   minTabs: 1, enabled: true, addEmptyPageWhen: null, sortKeys: null, fill: null },      // tab 8
+    { modeId: 'uniqueCharm',    minTabs: 1, enabled: true, addEmptyPageWhen: null, sortKeys: null, fill: null },      // tab 9
+    { modeId: 'magicCharm',     minTabs: 2, enabled: true, addEmptyPageWhen: null, sortKeys: null, fill: null },      // tabs 10-11
+    { modeId: 'uniqueJewel',    minTabs: 1, enabled: true, addEmptyPageWhen: null, sortKeys: null, fill: null },      // tab 12
+    { modeId: 'rareMagicJewel', minTabs: 1, enabled: true, addEmptyPageWhen: null, sortKeys: null, fill: null },      // tab 13
+    { modeId: 'set',            minTabs: 6, enabled: true, addEmptyPageWhen: 0, sortKeys: null, fill: null },         // tabs 14-19
+    { modeId: 'rareGear',       minTabs: 1, enabled: true, addEmptyPageWhen: 'never', sortKeys: null, fill: null },   // tab 20 onwards
   ],
 };
 
 let _ssAutoSortBaseRaw = null;   // parsed base/autosort.json, unvalidated
 let _ssAutoSortCache = null;     // memoised effective config
+
+// Everything derived from the config. _ssInvalidateAutoSortConfig is the one
+// place that drops the lot, so a new setting that caches something derived
+// has exactly one line to add.
+function _ssInvalidateAutoSortConfig() {
+  _ssAutoSortCache = null;
+  _ssResolvedModes = null;
+  _ssGearGroupsCache = null;
+}
 let _ssAutoSortWarnings = [];    // warnings from the last effective-config build
 
 function _ssSetAutoSortBaseConfig(raw) {
   _ssAutoSortBaseRaw = raw;
-  _ssAutoSortCache = null;
+  _ssInvalidateAutoSortConfig();
   // Surface base-file problems in the startup log — nobody is looking at the
   // shared stash yet, and a typo the maintainer committed should be loud.
   const w = [];
@@ -17814,6 +17910,38 @@ function _ssMergeAutoSortConfig(base, raw, label, warnings) {
     if (typeof raw[flag] === 'boolean') out[flag] = raw[flag];
     else warn(`${flag} must be true or false — kept ${out[flag]}.`);
   }
+  // Profiles are carried, not applied — _ssAutoSortConfig applies the active
+  // one last, after every layer has had its say about which one that is.
+  if ('profiles' in raw) {
+    if (!raw.profiles || typeof raw.profiles !== 'object' || Array.isArray(raw.profiles)) {
+      warn('profiles must be an object of name → settings — ignored.');
+    } else {
+      const got = {};
+      for (const [name, body] of Object.entries(raw.profiles)) {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) { warn(`profiles.${name} is not an object — dropped.`); continue; }
+        got[name] = body;
+      }
+      out.profiles = { ...out.profiles, ...got };
+    }
+  }
+  if ('activeProfile' in raw) {
+    if (raw.activeProfile === null || raw.activeProfile === '') out.activeProfile = null;
+    else if (typeof raw.activeProfile === 'string') out.activeProfile = raw.activeProfile;
+    else warn('activeProfile must be a profile name or null — ignored.');
+  }
+  if ('gearGroups' in raw) {
+    if (!Array.isArray(raw.gearGroups)) {
+      warn('gearGroups must be an array of bucket keys — ignored.');
+    } else {
+      const keys = [];
+      raw.gearGroups.forEach((k, i) => {
+        if (!SS_GEAR_GROUPS.some(g => g.key === k)) { warn(`gearGroups[${i}]: unknown bucket ${JSON.stringify(k)} — dropped.`); return; }
+        if (keys.includes(k)) { warn(`gearGroups[${i}]: duplicate bucket "${k}" — dropped.`); return; }
+        keys.push(k);
+      });
+      out.gearGroups = keys.length ? keys : null;
+    }
+  }
 
   if ('categories' in raw) {
     if (!Array.isArray(raw.categories)) {
@@ -17845,7 +17973,48 @@ function _ssMergeAutoSortConfig(base, raw, label, warnings) {
           rule = _ssNormEmptyPageRule(c.addEmptyPageWhen);
           if (rule === null) warn(`${at} (${c.modeId}): addEmptyPageWhen must be "never", "always" or a number 0-100 — inherited the global setting.`);
         }
-        cats.push({ modeId: c.modeId, minTabs, enabled, addEmptyPageWhen: rule });
+        const mode = SS_SORT_MODES.find(m => m.id === c.modeId);
+        const sortable = mode.streams.some(st => st.sortKeys);
+
+        let sortKeys = null;   // null = the mode's own default order
+        if ('sortKeys' in c) {
+          if (!sortable) {
+            warn(`${at} (${c.modeId}): this mode groups whole sets, so its order does not come from sort keys — sortKeys ignored.`);
+          } else if (!Array.isArray(c.sortKeys) || !c.sortKeys.length) {
+            warn(`${at} (${c.modeId}): sortKeys must be a non-empty array — used the default order.`);
+          } else {
+            const names = [];
+            c.sortKeys.forEach((n, j) => {
+              if (typeof n !== 'string' || !SS_SORT_KEY_FNS[n.replace(/^-/, '')]) {
+                warn(`${at} (${c.modeId}): sortKeys[${j}] is not a known key ${JSON.stringify(n)} — dropped.`); return;
+              }
+              names.push(n);
+            });
+            if (!names.length) warn(`${at} (${c.modeId}): sortKeys had no usable key — used the default order.`);
+            else sortKeys = names;
+          }
+        }
+
+        let fill = null;
+        if ('fill' in c) {
+          if (!c.fill || typeof c.fill !== 'object' || Array.isArray(c.fill)) {
+            warn(`${at} (${c.modeId}): fill must be an object of stream → direction — ignored.`);
+          } else {
+            const got = {};
+            for (const [sid, dir] of Object.entries(c.fill)) {
+              if (!mode.streams.some(st => st.id === sid)) {
+                warn(`${at} (${c.modeId}): fill has no stream "${sid}" — this mode has ${mode.streams.map(st => st.id).join(', ')}.`); continue;
+              }
+              if (!SS_FILL_DIRS.includes(dir)) {
+                warn(`${at} (${c.modeId}): fill.${sid} must be one of ${SS_FILL_DIRS.join(' / ')} — ignored.`); continue;
+              }
+              got[sid] = dir;
+            }
+            if (Object.keys(got).length) fill = got;
+          }
+        }
+
+        cats.push({ modeId: c.modeId, minTabs, enabled, addEmptyPageWhen: rule, sortKeys, fill });
       });
       if (!cats.length) warn('categories had no usable entry — kept the previous list.');
       else out.categories = cats;
@@ -17872,23 +18041,50 @@ function _ssSetAutoSortUserConfig(raw) {
     if (raw === null) localStorage.removeItem(SS_AUTOSORT_LS_KEY);
     else localStorage.setItem(SS_AUTOSORT_LS_KEY, JSON.stringify(raw, null, 2));
   } catch (e) {
-    _ssAutoSortCache = null;
+    _ssInvalidateAutoSortConfig();
     return e.message || String(e);
   }
-  _ssAutoSortCache = null;
+  _ssInvalidateAutoSortConfig();
   return null;
 }
 
-// Built-in → base file → user override. Memoised; every writer above clears
-// the cache.
+// Built-in → base file → user override → the active profile. Memoised; every
+// writer above clears the cache.
+//
+// The profile goes last so that whichever layer names it, its settings win —
+// picking a profile is meant to be the final word. It cannot nominate another
+// profile or redefine the set of them: those two fields are stripped before
+// it is applied, so there is no chain to follow and no way to loop.
 function _ssAutoSortConfig() {
   if (_ssAutoSortCache) return _ssAutoSortCache;
+  const built = _ssBuildAutoSortConfig(true);
+  _ssAutoSortWarnings = built.warnings;
+  _ssAutoSortCache = built.cfg;
+  return built.cfg;
+}
+
+// applyProfile false stops after the user override, which is what the
+// settings dialog edits: showing the profile's values merged in would mean
+// Apply silently bakes them into the override and the profile stops being a
+// separate thing you can switch away from.
+function _ssBuildAutoSortConfig(applyProfile) {
   const w = [];
   let cfg = _ssMergeAutoSortConfig(SS_AUTOSORT_BUILTIN, _ssAutoSortBaseRaw, 'autosort.json', w);
   cfg = _ssMergeAutoSortConfig(cfg, _ssAutoSortUserRaw(), L('ui_ss_auto_cfg_saved', 'saved settings'), w);
-  _ssAutoSortWarnings = w;
-  _ssAutoSortCache = cfg;
-  return cfg;
+
+  if (applyProfile && cfg.activeProfile) {
+    const body = cfg.profiles[cfg.activeProfile];
+    if (!body) {
+      w.push(`activeProfile: no profile named "${cfg.activeProfile}" — using the settings as they stand.`);
+    } else {
+      const { profiles, activeProfile, ...rest } = body;
+      if (profiles || activeProfile) w.push(`profiles.${cfg.activeProfile}: a profile cannot set profiles or activeProfile — those were ignored.`);
+      const applied = _ssMergeAutoSortConfig(cfg, rest, `profiles.${cfg.activeProfile}`, w);
+      cfg = { ...applied, profiles: cfg.profiles, activeProfile: cfg.activeProfile };
+    }
+  }
+
+  return { cfg, warnings: w };
 }
 
 // The categories that will actually run, in order.
@@ -18310,12 +18506,15 @@ window.ssAutoSortRun = function() {
 // to base/autosort.json. The dialog never sorts anything — the user closes it
 // and presses Auto Sort when they are ready.
 
-// The effective config, shaped the way the JSON file is written: category
-// entries carry addEmptyPageWhen only when they actually override the global.
+// The config as the JSON file writes it, with the profile NOT applied (see
+// _ssBuildAutoSortConfig). Fields that only mean "inherit" are left out, so
+// what comes back is the settings themselves rather than every resolved
+// value: a category carries addEmptyPageWhen / sortKeys / fill only when it
+// actually overrides something.
 function _ssAutoSortConfigJson() {
-  const cfg = _ssAutoSortConfig();
+  const cfg = _ssBuildAutoSortConfig(false).cfg;
   const unrule = (r) => (r === 0 ? 'always' : r);
-  return JSON.stringify({
+  const doc = {
     version: cfg.version,
     startTab: cfg.startTab,
     compactEmptyTabsFirst: cfg.compactEmptyTabsFirst,
@@ -18323,25 +18522,47 @@ function _ssAutoSortConfigJson() {
     addEmptyPageWhen: unrule(cfg.addEmptyPageWhen),
     continueOnFailure: cfg.continueOnFailure,
     skipConfirm: cfg.skipConfirm,
-    categories: cfg.categories.map(c => {
-      const o = { modeId: c.modeId, minTabs: c.minTabs, enabled: c.enabled };
-      if (c.addEmptyPageWhen !== null) o.addEmptyPageWhen = unrule(c.addEmptyPageWhen);
-      return o;
-    }),
-  }, null, 2);
+  };
+  if (cfg.gearGroups) doc.gearGroups = cfg.gearGroups;
+  if (cfg.activeProfile) doc.activeProfile = cfg.activeProfile;
+  if (Object.keys(cfg.profiles || {}).length) doc.profiles = cfg.profiles;
+  doc.categories = cfg.categories.map(c => {
+    const o = { modeId: c.modeId, minTabs: c.minTabs, enabled: c.enabled };
+    if (c.addEmptyPageWhen !== null) o.addEmptyPageWhen = unrule(c.addEmptyPageWhen);
+    if (c.sortKeys) o.sortKeys = c.sortKeys;
+    if (c.fill) o.fill = c.fill;
+    return o;
+  });
+  return JSON.stringify(doc, null, 2);
 }
 
 window.openAutoSortSettings = function() {
   const modeList = SS_SORT_MODES.map(m => m.id).join(', ');
+  const keyList  = Object.keys(SS_SORT_KEY_FNS).join(', ');
   const hasOverride = _ssAutoSortUserRaw() !== null;
+  const shown = _ssBuildAutoSortConfig(false).cfg;
+  const profileNames = Object.keys(shown.profiles || {});
+
+  const profileHtml = profileNames.length ? `
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+      <span style="font-size:12px;color:var(--d2-text-dim)">${esc(L('ui_ss_auto_cfg_profile', 'Profile'))}</span>
+      <select id="ssAutoCfgProfile" style="background:var(--d2-surface2);color:var(--d2-text);border:1px solid var(--d2-border);padding:5px 8px;font-size:12px;outline:none">
+        <option value=""${shown.activeProfile ? '' : ' selected'}>${esc(L('ui_ss_auto_cfg_profile_none', '(none — settings below as they are)'))}</option>
+        ${profileNames.map(n => `<option value="${esc(n)}"${shown.activeProfile === n ? ' selected' : ''}>${esc(n)}</option>`).join('')}
+      </select>
+    </div>` : '';
 
   const bodyHtml = `
     <div style="color:var(--d2-text-dim);font-size:12px;line-height:1.5;margin-bottom:8px">
       ${esc(L('ui_ss_auto_cfg_help', 'Order of the categories list is the tab order. addEmptyPageWhen takes "never", "always" or a number 0-100 — the fill percentage of a category\'s last tab above which it is given one more empty tab.'))}
     </div>
-    <div style="color:var(--d2-text-dim);font-size:11px;line-height:1.5;margin-bottom:10px">
+    <div style="color:var(--d2-text-dim);font-size:11px;line-height:1.5;margin-bottom:4px">
       ${esc(L('ui_ss_auto_cfg_modes', 'Valid modeId values:'))} ${esc(modeList)}
     </div>
+    <div style="color:var(--d2-text-dim);font-size:11px;line-height:1.5;margin-bottom:10px">
+      ${esc(L('ui_ss_auto_cfg_keys', 'Valid sortKeys (prefix with - to reverse):'))} ${esc(keyList)}
+    </div>
+    ${profileHtml}
     <textarea id="ssAutoCfgText" spellcheck="false"
       style="width:100%;height:300px;box-sizing:border-box;background:var(--d2-surface2);color:var(--d2-text);border:1px solid var(--d2-border);padding:8px 10px;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.45;outline:none;resize:vertical"></textarea>
     <div id="ssAutoCfgStatus" style="min-height:18px;font-size:12px;line-height:1.5;margin-top:8px;text-align:left;white-space:pre-line"></div>
@@ -18380,6 +18601,24 @@ window.openAutoSortSettings = function() {
   let text = ta.value;
   ta.addEventListener('input', () => { text = ta.value; });
 
+  // Switching profile edits activeProfile in the box rather than saving on
+  // the spot, so the whole dialog still commits through one Apply.
+  const profileSel = overlay.querySelector('#ssAutoCfgProfile');
+  if (profileSel) {
+    profileSel.addEventListener('change', () => {
+      let doc;
+      try { doc = JSON.parse(text); }
+      catch (e) { say(L('ui_ss_auto_cfg_badjson_profile', 'Fix the JSON below before switching profile.'), 'bad'); return; }
+      if (profileSel.value) doc.activeProfile = profileSel.value;
+      else delete doc.activeProfile;
+      ta.value = JSON.stringify(doc, null, 2);
+      text = ta.value;
+      say(profileSel.value
+        ? Lfmt('ui_ss_auto_cfg_profile_set', 'Profile "{name}" selected. Press Apply to save it.', { name: profileSel.value })
+        : L('ui_ss_auto_cfg_profile_cleared', 'Profile cleared. Press Apply to save it.'));
+    });
+  }
+
   function _ssApplyAutoSortSettings() {
     let raw;
     try {
@@ -18388,16 +18627,19 @@ window.openAutoSortSettings = function() {
       showPopup(Lfmt('ui_ss_auto_cfg_badjson', 'That is not valid JSON, so nothing was saved.\n\n{detail}', { detail: e.message }));
       return;
     }
-    const warnings = [];
-    _ssMergeAutoSortConfig(SS_AUTOSORT_BUILTIN, raw, L('ui_ss_auto_cfg_saved', 'saved settings'), warnings);
     const err = _ssSetAutoSortUserConfig(raw);
     if (err) {
       showPopup(Lfmt('ui_ss_auto_cfg_nostore', 'Could not save to this browser\'s storage. ({detail})', { detail: err }));
       return;
     }
+    // Report against the config as it actually resolved, not against the new
+    // text alone: that way a profile the settings name but do not define, or
+    // a field the base file and the override disagree about, shows up too.
+    _ssAutoSortConfig();
+    const warnings = _ssAutoSortWarnings;
     let out = L('ui_ss_auto_cfg_saved_ok', 'Saved. The next Auto Sort run uses these settings.');
     if (warnings.length) {
-      out += '\n\n' + L('ui_ss_auto_cfg_warned', 'Some fields were not usable and fell back to the defaults:') +
+      out += '\n\n' + L('ui_ss_auto_cfg_warned', 'Some settings were not usable and fell back to the defaults:') +
              '\n' + warnings.map(w => '• ' + w).join('\n');
     }
     showPopup(out);

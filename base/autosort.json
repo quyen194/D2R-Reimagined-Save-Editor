@@ -8,6 +8,12 @@
   "continueOnFailure": false,
   "skipConfirm": false,
 
+  "activeProfile": null,
+  "profiles": {
+    "compact":  { "addEmptyPageWhen": "never",  "padding": "off" },
+    "spacious": { "addEmptyPageWhen": "always", "padding": "roundRobin" }
+  },
+
   "categories": [
     { "modeId": "uniqueGear",     "minTabs": 5, "enabled": true },
     { "modeId": "uniqueRingAmu",  "minTabs": 1, "enabled": true },

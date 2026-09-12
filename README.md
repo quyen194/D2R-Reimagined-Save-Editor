@@ -53,9 +53,10 @@ The editor relies on external data from the D2R Reimagined repository (item data
   along; ones that come up short keep their tabs blank, and a category you own nothing of is
   still handed its tabs once everything else is placed. Each step commits on its own and rolls
   itself back if it fails
-- Auto Sort settings (⚙ next to the button): the layout and the run's behaviour come from
-  [`base/autosort.json`](base/autosort.json) and can be overridden per browser. Edit the JSON in
-  place, or Import / Export it as a file. See [Auto Sort settings](#auto-sort-settings) below
+- Auto Sort settings (⚙ next to the button): the layout, the sort order within each
+  category, and the run's behaviour come from [`base/autosort.json`](base/autosort.json) and
+  can be overridden per browser. Edit the JSON in place, switch between named profiles, or
+  Import / Export it as a file. See [Auto Sort settings](#auto-sort-settings) below
 
 ### Vault System
 - Load and save `.d2i` vault files
@@ -156,6 +157,9 @@ make the layout ugly, but it can't make the sort do something unsafe.
 | `addEmptyPageWhen` | `"never"` \| `"always"` \| 0–100 | `30` | Give a category one extra empty tab when the **last tab of its run** is more than this percent full. `"always"` is the same as `0`. Independent of `padding` |
 | `continueOnFailure` | boolean | `false` | Keep going past a category that fails instead of stopping the run there |
 | `skipConfirm` | boolean | `false` | Skip the confirmation dialog |
+| `gearGroups` | array of bucket keys | mode default | Pull equipment buckets to the front of the slot order. Anything left out keeps its built-in place behind them |
+| `profiles` | object | two examples | Named sets of settings — see below |
+| `activeProfile` | string \| `null` | `null` | Which profile is in force |
 
 ### Per-category options
 
@@ -168,9 +172,71 @@ categories.
 | `minTabs` | integer ≥ 1 | `1` | Tabs the category reserves before it has to borrow more |
 | `enabled` | boolean | `true` | `false` skips the category entirely — its items are left untouched and it claims no tabs |
 | `addEmptyPageWhen` | as above | inherits the global | Per-category override |
+| `sortKeys` | array of key names | mode default | The order items sort in. Prefix a name with `-` to reverse it |
+| `fill` | object of stream → direction | mode default | Which way each of the mode's streams fills a tab: `row`, `colL` or `colR` |
 
 Valid `modeId` values: `set`, `uniqueGear`, `rareGear`, `uniqueCharm`, `magicCharm`,
 `uniqueJewel`, `rareMagicJewel`, `uniqueRingAmu`, `rareRingAmu`, `magicRingAmu`.
+
+### Sort keys
+
+`sortKeys` replaces a category's ordering with your own. Keys compare in the order listed;
+a `-` prefix reverses that key.
+
+| Key | Meaning |
+| --- | --- |
+| `handTier` | Armor, then one-handed weapons, then two-handed |
+| `gearGroup` | Equipment bucket (helm, body armor, belt, …), per `gearGroups` |
+| `quality` | Crafted before unique |
+| `reqLevel` | Required level to equip |
+| `ilvl` | Item level |
+| `height` | Grid height — grand, large, then small charms |
+| `baseName` | Base item name |
+
+The shipped defaults, written out:
+
+```
+uniqueGear      handTier, gearGroup, quality, reqLevel, -ilvl, baseName
+rareGear        handTier, gearGroup, reqLevel, -ilvl, baseName
+uniqueCharm     -height, quality, reqLevel, -ilvl, baseName
+magicCharm      -height, reqLevel, -ilvl, baseName
+uniqueJewel     quality, reqLevel, -ilvl, baseName
+rareMagicJewel  reqLevel, -ilvl, baseName
+uniqueRingAmu   quality, reqLevel, -ilvl, baseName
+rareRingAmu     reqLevel, -ilvl, baseName
+magicRingAmu    reqLevel, -ilvl, baseName
+```
+
+`set` takes no `sortKeys`: its order comes from keeping whole sets together, not from a
+per-item key.
+
+`sortKeys` and `fill` apply to the **Sort Items** modal as well as to Auto Sort — one
+category, one definition of how it sorts.
+
+**`gearGroups` interacts with `sortKeys`.** `handTier` runs ahead of `gearGroup`, so
+reordering buckets only has an effect *within* a hand tier. To put weapons before armor,
+drop `handTier` from that category's `sortKeys` as well.
+
+Bucket keys: `helm`, `tors`, `belt`, `glov`, `boot`, `shld`, `axe`, `swor`, `knif`,
+`blun`, `scep`, `wand`, `staf`, `orb`, `spea`, `pole`, `jave`, `bow`, `bowq`, `xbow`,
+`xboq`, `h2h`, `weap`.
+
+### Profiles
+
+A profile is a partial config applied last, after every other layer — so whichever layer
+names it, its settings win. It cannot select another profile or redefine the set of them,
+so there is no chain to follow. The gear dialog shows a dropdown whenever any profile
+exists; picking one edits `activeProfile` in the box, and Apply commits it like any other
+change. The box always shows your settings *without* the profile applied, so switching
+away restores them.
+
+```json
+"activeProfile": "compact",
+"profiles": {
+  "compact":  { "addEmptyPageWhen": "never",  "padding": "off" },
+  "spacious": { "addEmptyPageWhen": "always", "padding": "roundRobin" }
+}
+```
 
 ### Example
 
@@ -183,6 +249,13 @@ Valid `modeId` values: `set`, `uniqueGear`, `rareGear`, `uniqueCharm`, `magicCha
   "addEmptyPageWhen": 30,
   "continueOnFailure": false,
   "skipConfirm": false,
+
+  "activeProfile": null,
+  "profiles": {
+    "compact":  { "addEmptyPageWhen": "never",  "padding": "off" },
+    "spacious": { "addEmptyPageWhen": "always", "padding": "roundRobin" }
+  },
+
   "categories": [
     { "modeId": "uniqueGear",     "minTabs": 5, "enabled": true },
     { "modeId": "uniqueRingAmu",  "minTabs": 1, "enabled": true },
