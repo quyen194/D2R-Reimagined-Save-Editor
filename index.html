@@ -17810,6 +17810,7 @@ const SS_FILL_DIRS = ['row', 'colL', 'colR'];
 const SS_AUTOSORT_BUILTIN = {
   version: SS_AUTOSORT_SCHEMA_VERSION,
   startTab: 0,
+  blankTabsAtStart: 3,
   compactEmptyTabsFirst: true,
   padding: 'roundRobin',
   addEmptyPageWhen: 30,
@@ -17891,10 +17892,11 @@ function _ssMergeAutoSortConfig(base, raw, label, warnings) {
   if ('version' in raw && raw.version !== SS_AUTOSORT_SCHEMA_VERSION) {
     warn(`version ${JSON.stringify(raw.version)} is not ${SS_AUTOSORT_SCHEMA_VERSION} — loading it anyway.`);
   }
-  if ('startTab' in raw) {
-    const n = _ssNormInt(raw.startTab, 0, 999);
-    if (n === null) warn(`startTab must be a whole number >= 0 — kept ${out.startTab}.`);
-    else out.startTab = n;
+  for (const num of ['startTab', 'blankTabsAtStart']) {
+    if (!(num in raw)) continue;
+    const n = _ssNormInt(raw[num], 0, 999);
+    if (n === null) warn(`${num} must be a whole number >= 0 — kept ${out[num]}.`);
+    else out[num] = n;
   }
   if ('padding' in raw) {
     if (SS_AUTOSORT_PADDING_MODES.includes(raw.padding)) out.padding = raw.padding;
@@ -18285,7 +18287,58 @@ function _ssRunAutoSort() {
   }
   for (let k = 0; k < steps.length; k++) steps[k].tabs += padding.added[k];
 
-  return { steps, padding, failures, failed: null, startTab };
+  // Last of all, and its own step with its own rollback for the same reason
+  // padding is: by now the layout is right, and a staging area that cannot be
+  // carved out must not cost the sorting that just succeeded.
+  let blanks = { want: cfg.blankTabsAtStart, added: 0 };
+  if (cfg.blankTabsAtStart > 0) {
+    const backupBlank = sharedStashData.slice();
+    try {
+      const layoutEnd = spans.length ? spans[spans.length - 1].end : startTab;
+      blanks.added = _ssAddBlankTabsAtStart(cfg.blankTabsAtStart, startTab, layoutEnd);
+      if (blanks.added) {
+        if (_ssChainOkAtLoad) {
+          const problem = validateSharedStashChain(sharedStashData) || validateSharedStashRecords();
+          if (problem) throw new Error(problem);
+        }
+        markSharedStashDirty();
+        renderSharedStashTabs();
+      }
+    } catch (e) {
+      sharedStashData = backupBlank;
+      parseSharedStash();
+      renderSharedStashTabs();
+      console.error('Auto sort blank tabs rolled back:', e);
+      blanks = { want: cfg.blankTabsAtStart, added: 0, error: e.message };
+    }
+  }
+
+  return { steps, padding, blanks, failures, failed: null, startTab };
+}
+
+// Pulls `n` empty tabs to the front of the layout: after the tabs startTab
+// reserved, before the first category. A staging area to drop new finds into,
+// which stays empty because nothing is ever placed ahead of the layout's
+// first slot.
+//
+// The blanks come from behind the layout only — a blank inside it is part of
+// some category's quota. Each one that moves up pushes the layout one slot
+// along, hence the `added` offsets. Returns how many it managed, which is
+// fewer than asked for only when the stash has no empty tab left to give.
+function _ssAddBlankTabsAtStart(n, startTab, layoutEnd) {
+  let added = 0;
+  for (let k = 0; k < n; k++) {
+    const regular = _ssRegularTabIndices();
+    let src = -1;
+    for (let p = regular.length - 1; p >= layoutEnd + added; p--) {
+      if (sharedStashParsed.tabs[regular[p]].items.length === 0) { src = p; break; }
+    }
+    if (src < 0) break;
+    const dst = startTab + added;
+    if (src !== dst && !_ssMoveRegularTabContent(regular[src], regular[dst])) break;
+    added++;
+  }
+  return added;
 }
 
 // Hands every category that came up short of its quota the tabs it is owed,
@@ -18430,8 +18483,10 @@ window.ssAutoSortRun = function() {
   }
 
   // Slot numbers as the layout would come out with no overflow at all — the
-  // shape the user asked for, and what they see if every category fits.
-  let slot = cfg.startTab + 1;
+  // shape the user asked for, and what they see if every category fits. The
+  // blank tabs are carved out last but end up ahead of the layout, so the
+  // numbering here has to account for them up front.
+  let slot = cfg.startTab + cfg.blankTabsAtStart + 1;
   const lines = layout.map(spec => {
     const mode = _ssSortMode(spec.modeId);
     const from = slot, to = slot + spec.minTabs - 1;
@@ -18442,6 +18497,13 @@ window.ssAutoSortRun = function() {
                      : Lfmt('ui_ss_auto_tab_range', 'Tabs {from}-{to}', { from, to }));
     return `${span}: ${mode.label()}`;
   });
+  if (cfg.blankTabsAtStart > 0) {
+    const from = cfg.startTab + 1, to = cfg.startTab + cfg.blankTabsAtStart;
+    lines.unshift(Lfmt('ui_ss_auto_blank_line',
+      '{range}: left empty for you to drop things into (blankTabsAtStart)',
+      { range: from === to ? Lfmt('ui_ss_auto_tab_one', 'Tab {n}', { n: from })
+                           : Lfmt('ui_ss_auto_tab_range', 'Tabs {from}-{to}', { from, to }) }));
+  }
   if (cfg.startTab > 0) {
     lines.unshift(Lfmt('ui_ss_auto_reserved_line',
       'Tabs 1-{n}: left untouched (startTab)', { n: cfg.startTab }));
@@ -18488,6 +18550,17 @@ window.ssAutoSortRun = function() {
         'The stash ran out of empty tabs before every blank category got its full quota — still owed: {list}.',
         { list });
     }
+    const bl = run.blanks;
+    if (bl && bl.want > 0 && bl.added < bl.want && !bl.error) {
+      out += '\n\n' + Lfmt('ui_ss_auto_blank_short',
+        'Only {got} of the {want} empty tabs asked for at the start could be carved out — the stash had no more empty tabs to spare.',
+        { got: bl.added, want: bl.want });
+    }
+    if (bl && bl.error) {
+      out += '\n\n' + Lfmt('ui_ss_auto_blank_failed',
+        'Moving the empty tabs to the start failed and was rolled back, so the sorted tabs are correct but the empty ones are missing. ({detail})',
+        { detail: bl.error });
+    }
     if (pad && pad.error) {
       out += '\n\n' + Lfmt('ui_ss_auto_pad_failed',
         'Reserving the blank tabs failed and was rolled back, so the sorted tabs are correct but the blank ones are missing. ({detail})',
@@ -18517,6 +18590,7 @@ function _ssAutoSortConfigJson() {
   const doc = {
     version: cfg.version,
     startTab: cfg.startTab,
+    blankTabsAtStart: cfg.blankTabsAtStart,
     compactEmptyTabsFirst: cfg.compactEmptyTabsFirst,
     padding: cfg.padding,
     addEmptyPageWhen: unrule(cfg.addEmptyPageWhen),

@@ -2,6 +2,7 @@
   "version": 1,
 
   "startTab": 0,
+  "blankTabsAtStart": 3,
   "compactEmptyTabsFirst": true,
   "padding": "roundRobin",
   "addEmptyPageWhen": 30,

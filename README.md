@@ -152,6 +152,7 @@ make the layout ugly, but it can't make the sort do something unsafe.
 | --- | --- | --- | --- |
 | `version` | number | `1` | Schema version |
 | `startTab` | integer ≥ 0 | `0` | Leave the first N tabs completely alone — not sorted, not used as a source, not borrowed. Your junk/mule tabs |
+| `blankTabsAtStart` | integer ≥ 0 | `3` | Carve out N **empty** tabs just after the reserved ones, ahead of the layout. A staging area to drop new finds into; nothing is ever sorted into them. Done last of all, after everything else has settled |
 | `compactEmptyTabsFirst` | boolean | `true` | Slide empty tabs to the end before sorting. Turning it off strands empty tabs mid-stash, which makes "not enough room" failures far more likely |
 | `padding` | `roundRobin` \| `inOrder` \| `off` | `roundRobin` | How blank tabs are handed to categories that came up short of `minTabs`. `roundRobin` shares a shortage out; `inOrder` fills the top of the list first; `off` hands out nothing |
 | `addEmptyPageWhen` | `"never"` \| `"always"` \| 0–100 | `30` | Give a category one extra empty tab when the **last tab of its run** is more than this percent full. `"always"` is the same as `0`. Independent of `padding` |
@@ -160,6 +161,11 @@ make the layout ugly, but it can't make the sort do something unsafe.
 | `gearGroups` | array of bucket keys | mode default | Pull equipment buckets to the front of the slot order. Anything left out keeps its built-in place behind them |
 | `profiles` | object | two examples | Named sets of settings — see below |
 | `activeProfile` | string \| `null` | `null` | Which profile is in force |
+
+`startTab` and `blankTabsAtStart` are different things. `startTab` **protects tabs you
+already have** — whatever is in them stays in them. `blankTabsAtStart` **creates empty
+tabs**, pulling spares from the end of the stash and pushing the layout along. Set both
+and you get your existing mule tabs, then the empty ones, then the sorted categories.
 
 ### Per-category options
 
@@ -244,6 +250,7 @@ away restores them.
 {
   "version": 1,
   "startTab": 0,
+  "blankTabsAtStart": 3,
   "compactEmptyTabsFirst": true,
   "padding": "roundRobin",
   "addEmptyPageWhen": 30,
