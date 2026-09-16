@@ -8547,6 +8547,7 @@ function parseD2S(buf) {
 
       out.items.push(item);
     }
+    out.items = _dropScanHitsInsideItems(buf, out.items);
 
     // Merc items — same byte-pattern signature as the character scan above.
     const jfOff = jm2Off > 0 ? findMarker(buf,'jf', jm2Off) : -1;
@@ -8588,11 +8589,42 @@ function parseD2S(buf) {
             });
           }
         }
+        const charItems = out.items.filter(it => !it.isMerc);
+        out.items = charItems.concat(_dropScanHitsInsideItems(buf, out.items.filter(it => it.isMerc)));
       }
     }
   }
 
   return out;
+}
+
+// The byte-pattern item scan also fires inside real records: a magic grand
+// charm's bits matched the signature and showed up as a runeword Lich Wand in
+// the cube, which the game doesn't have. Since byte operations take an item's
+// length from the gap to the next offset, such a hit also cuts its host record
+// short. Drop a hit only when it lands inside an item whose end is known: one
+// whose property list passed the position check (magic, rare, set, unique,
+// crafted), so a misdecoded item can never hide the real item after it.
+// `items` must be in byte order.
+function _dropScanHitsInsideItems(buf, items) {
+  const kept = [];
+  let trustedEnd = 0;
+  for (const it of items) {
+    if (it.byteOffset < trustedEnd) {
+      console.warn(`parseD2S: dropped scan hit ${it.typeCode} at byte ${it.byteOffset}, inside the item before it`);
+      continue;
+    }
+    kept.push(it);
+    if (it.simple || it.runeword) continue;
+    try {
+      const ext = decodeItemProperties(buf, it.byteOffset, it);
+      const q = ext && ext.quality;
+      if (q >= 4 && q <= 8 && !ext.propListUnreliable && !ext.decodeError && ext.endBit) {
+        trustedEnd = it.byteOffset + Math.ceil(ext.endBit / 8);
+      }
+    } catch (_) {}
+  }
+  return kept;
 }
 
 // ═══════════════════════════════════════════════════════════
