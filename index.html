@@ -3464,13 +3464,18 @@ function resolveSetMods(item) {
   return { lines, setBonusLines };
 }
 
+// Rare and crafted items store up to three prefix/suffix pairs, interleaved:
+// even slots index magicprefix.txt, odd slots magicsuffix.txt. Checked against a
+// rare mask whose six stats all matched only under this reading.
+function _rareAffixTable(slot) {
+  return slot % 2 === 0 ? MAGIC_PREFIX_MODS : MAGIC_SUFFIX_MODS;
+}
+
 function resolveRareMods(item) {
   const lines = [];
   if (!item._rareAffixes || !item._rareAffixes.length) return { lines, setBonusLines: [] };
   for (const affix of item._rareAffixes) {
-    const isPrefix = affix.slot < 3;
-    const table = isPrefix ? MAGIC_PREFIX_MODS : MAGIC_SUFFIX_MODS;
-    const entry = table[affix.id];
+    const entry = _rareAffixTable(affix.slot)[affix.id];
     if (!entry) continue;
     for (const mod of entry.mods) {
       lines.push(...propToDisplay(mod.code, mod.min, mod.max, mod.param));
@@ -3494,10 +3499,12 @@ function buildItemTypeSets() {
       if (code) newArmor.add(code);
     }
   }
+  const newStackWeapon = new Set();
   if (weaponData) {
     for (const row of weaponData.rows) {
       const code = (row['code'] || '').trim();
       if (code) newWeapon.add(code);
+      if (code && (row['stackable'] || '').trim() === '1') newStackWeapon.add(code);
     }
   }
   const newAdvStack = new Set();
@@ -3539,6 +3546,7 @@ function buildItemTypeSets() {
   ARMOR_SET          = newArmor.size        ? newArmor        : ARMOR_SET;
   WEAPON_SET         = newWeapon.size       ? newWeapon       : WEAPON_SET;
   STACK_SET          = newStack.size        ? newStack        : STACK_SET;
+  STACK_WEAPON_SET   = newStackWeapon.size  ? newStackWeapon  : STACK_WEAPON_SET;
   MISC_SET           = newMisc.size         ? newMisc         : MISC_SET;
   ADV_STACK_SET      = newAdvStack.size     ? newAdvStack     : ADV_STACK_SET;
   EXTENDED_MISC_SET  = newExtendedMisc.size ? newExtendedMisc : EXTENDED_MISC_SET;
@@ -12031,6 +12039,9 @@ let MISC_SET=new Set('box rin amu jew cm1 cm2 cm3 cm4 gld ear toa tch bks bkd qe
 // these items as having no decoded properties and let the per-instance qty
 // (read separately via parseSharedStash's advancedQty path) carry the count.
 let ADV_STACK_SET = new Set();
+// Throwing weapons (weapons.txt stackable=1) carry the same 9-bit quantity as
+// stackable misc items, after their durability.
+let STACK_WEAPON_SET = new Set();
 
 // Misc items with `compactsave=0` in misc.txt — these are stored as full
 // extended items (with item_id / ilvl / quality / mp / cs / timestamp), NOT
@@ -12120,9 +12131,15 @@ function _readPropList(buf, byteOff, startBit) {
   return { ...primary, startBit };
 }
 
+// Stats the game writes alongside plain min/max damage (dmg-norm and similar):
+// two-handed and throwing weapons carry the secondary and throw variants too,
+// sometimes instead of the plain pair. propCodeToStatEntries only names the
+// plain pair, so the position check accepts any of them.
+const _DAMAGE_STAT_ALIASES = { 21: [23, 159], 22: [24, 160], 23: [21, 159], 24: [22, 160] };
+
 // Stat IDs each property source can place in an item's property list: one Set
 // per source that maps to at least one stat. A source is a magic affix (all of
-// its mods together) or a single unique-item property.
+// its mods together) or a single unique/set-item property.
 function _propStatIdGroups(sources) {
   const groups = [];
   for (const mods of sources) {
@@ -12130,7 +12147,10 @@ function _propStatIdGroups(sources) {
     for (const mod of mods) {
       // Both bounds: _addStatEntry drops a value its save bits can't hold.
       for (const mode of ['min', 'max']) {
-        for (const e of propCodeToStatEntries(mod.code, mod.min, mod.max, mod.param, mode)) ids.add(e.id);
+        for (const e of propCodeToStatEntries(mod.code, mod.min, mod.max, mod.param, mode)) {
+          ids.add(e.id);
+          for (const alias of _DAMAGE_STAT_ALIASES[e.id] || []) ids.add(alias);
+        }
       }
     }
     if (ids.size) groups.push(ids);
@@ -12143,45 +12163,82 @@ function _magicAffixStatIds(prefixId, suffixId) {
     .filter(Boolean).map(affix => affix.mods));
 }
 
-function _uniqueItemStatIds(uniqueId) {
-  const entry = UNIQUE_ITEM_MODS[uniqueId];
-  if (!entry) return [];
-  return _propStatIdGroups(entry.props.map(p => [{ code: p.code, min: p.min, max: p.max, param: p.par }]));
+function _rareAffixStatIds(rareAffixes) {
+  return _propStatIdGroups((rareAffixes || [])
+    .map(a => _rareAffixTable(a.slot)[a.id])
+    .filter(Boolean).map(affix => affix.mods));
 }
 
+// Unique and set items: one group per txt property. For a set item these are
+// its own properties only; the partial set bonuses live in separate lists
+// after the main one. D2RR's hidden bookkeeping properties are not always
+// written, so their groups are marked optional: allowed, but not required.
+// Seen missing: oskill_hide
+// ("Hidden Charm Passive") on socketed set weapons, charm-property
+// (charm_weight) on pierce-immunity grand charms.
+const _OPTIONAL_TXT_PROPS = new Set(['oskill_hide', 'charm-property', 'uberstone-property']);
+function _txtItemStatIds(entry) {
+  if (!entry) return [];
+  const groups = [];
+  for (const p of entry.props) {
+    const [g] = _propStatIdGroups([[{ code: p.code, min: p.min, max: p.max, param: p.par }]]);
+    if (!g) continue;
+    if (_OPTIONAL_TXT_PROPS.has(p.code)) g.optional = true;
+    groups.push(g);
+  }
+  return groups;
+}
+
+// Stat IDs one decoded record covers: its own plus the followers
+// _readPropListAt folds into it (an elemental max damage rides in value2).
+function _modStatIds(mod) {
+  const ids = [mod.id];
+  const follow = mod.id < FOLLOW_STATS.length ? FOLLOW_STATS[mod.id] : 0;
+  for (let f = 1; f <= follow; f++) ids.push(mod.id + f);
+  return ids;
+}
+
+// D2RR V105 items carry a fixed 128-bit (16-byte) block the vanilla header
+// layout doesn't have. It sits ahead of defense/durability: read past it, a
+// rare mask's durability comes out as the 10 of 20 the game shows. Measured
+// across a full save, 128 is by far the most common gap before the property
+// list, and the vanilla position almost never works. Advanced-stack items land
+// one bit later because of the extra pad the decoder handles separately.
 const D2RR_EXTRA_HEADER_BITS = 128;
 
-// Prop-list position check for magic and unique items. The header walk in
-// decodeItemProperties assumes the vanilla layout, but many D2RR V105 items
-// carry extra bits before the property list, so the walk can start early and
-// still hit a stray 511 by coincidence — a small charm "of Life" (+7 Life in
-// game) decoded as five random stats, the Valknut unique charm as one. So check
-// each decode against what the item's txt row can roll (`groups`, one Set per
-// affix or unique property): a plausible list terminates cleanly, skips no
-// zero-save-bit IDs, and carries at least one stat from every group. Stats the
-// txt row doesn't explain are allowed — D2RR adds its own (charms carry
-// charm_weight, soulstones soulstone_weight) — but a list can also start in
-// garbage and run into the real stats, so among the plausible candidates the
-// one with the fewest unexplained stats wins, the header walk's on a tie.
-// Candidates past the 128-bit block are measured from `assumedStart` (where the
-// header walk ended) rather than from the primary decode — _readPropList's
-// one-bit alignment recovery may have moved that one, which would carry the
-// same one-bit error into the retry. The +1 variant covers items that do have
-// that one-bit gap. The returned startBit feeds the Item Editor's splice, which
-// copies every bit before it verbatim, so the unknown block survives an edit.
-// `unreliable` means no decode was plausible: callers must not trust `list`.
-function _checkPropListPosition(buf, byteOff, primary, assumedStart, groups) {
-  if (!groups.length) return { list: primary, unreliable: false };
+// Prop-list position check for magic, rare, crafted, set and unique items. The
+// vanilla header walk misses D2RR's block, so it can start early and still hit
+// a stray 511 by coincidence — a small charm "of Life" (+7 Life in game)
+// decoded as five random stats, the Valknut unique charm as one. So check each
+// decode against what the item's txt row can roll (`groups`, one Set per affix
+// or txt property): a plausible list terminates cleanly, skips no
+// zero-save-bit IDs, and carries at least one stat from every group not marked
+// optional. Stats the txt row doesn't explain are allowed — D2RR adds its own
+// (charms carry charm_weight, soulstones soulstone_weight) — but a list can
+// also start in garbage and run into the real stats, so among the plausible
+// candidates the one with the fewest unexplained stats wins, the header walk's
+// on a tie.
+// `blockStart` is where the header walk ends when it accounts for the block
+// (walked again rather than added to the primary decode's start, since the
+// fields after the block have their own lengths and _readPropList's one-bit
+// alignment recovery may have moved the primary). The +1 variant covers items
+// with the one-bit gap. The returned startBit feeds the Item Editor's splice,
+// which copies every bit before it verbatim, so the unknown block survives an
+// edit. `unreliable` means no decode was plausible: callers must not trust `list`.
+function _checkPropListPosition(buf, byteOff, primary, blockStart, groups) {
+  const required = groups.filter(g => !g.optional);
+  if (!required.length) return { list: primary, unreliable: false };
   const known = new Set();
   for (const g of groups) for (const id of g) known.add(id);
+  const has = (list, g) => list.mods.some(m => _modStatIds(m).some(id => g.has(id)));
   const candidates = [primary];
-  for (const start of [assumedStart + D2RR_EXTRA_HEADER_BITS, assumedStart + D2RR_EXTRA_HEADER_BITS + 1]) {
+  for (const start of [blockStart, blockStart + 1]) {
     candidates.push({ ..._readPropListAt(buf, byteOff, start), startBit: start });
   }
   let best = null, bestUnexplained = Infinity;
   for (const list of candidates) {
-    if (!list.terminated || list.skipped || !groups.every(g => list.mods.some(m => g.has(m.id)))) continue;
-    const unexplained = list.mods.filter(m => !known.has(m.id)).length;
+    if (!list.terminated || list.skipped || !required.every(g => has(list, g))) continue;
+    const unexplained = list.mods.filter(m => !_modStatIds(m).some(id => known.has(id))).length;
     if (unexplained < bestUnexplained) { best = list; bestUnexplained = unexplained; }
   }
   return best ? { list: best, unreliable: false } : { list: primary, unreliable: true };
@@ -12246,23 +12303,41 @@ function decodeItemProperties(buf, byteOff, item) {
     if(tc==='tbk'||tc==='tsc')bit+=5;
     bit+=1; // timestamp
     const isArm=ARMOR_SET.has(code), isWep=WEAPON_SET.size?WEAPON_SET.has(code):(!ARMOR_SET.has(code)&&!STACK_SET.has(code)&&!MISC_SET.has(code)&&code.length===3);
-    if(isArm)bit+=11;
-    if(isArm||isWep){const md=rbL(bit,8);bit+=8;if(md>0)bit+=10;}  // D2R V105: curDur is 10 bits
-    if(STACK_SET.has(code))bit+=9;
-    r.numSocketsBitOff = bit;  // 4-bit numSockets field lives here (or would, if socketed=1)
-    if(item.socketed)bit+=4;
-    let sbf=0;if(q===5){sbf=rbL(bit,5);bit+=5;}
-    let _mainList=_readPropList(buf,byteOff,bit);
-    if((q===4||q===7)&&!item.runeword){
-      const groups=q===4?_magicAffixStatIds(r._prefixId,r._suffixId):_uniqueItemStatIds(r.uniqueId);
-      const chk=_checkPropListPosition(buf,byteOff,_mainList,bit,groups);
+    const hasQty=STACK_SET.has(code)||STACK_WEAPON_SET.has(code);
+    // The rest of the header, with `extra` bits of D2RR's unknown block ahead
+    // of it (see D2RR_EXTRA_HEADER_BITS). Defense and durability sit after the
+    // block, so a walk that misses it reads them from the block and can skip
+    // the wrong number of curDur bits.
+    const walkTail=(extra)=>{
+      let b=bit+extra;
+      if(isArm)b+=11;
+      if(isArm||isWep){const md=rbL(b,8);b+=8;if(md>0)b+=10;}  // D2R V105: curDur is 10 bits
+      if(hasQty)b+=9;
+      const sockOff=b;  // 4-bit numSockets field lives here (or would, if socketed=1)
+      if(item.socketed)b+=4;
+      let sbf=0;if(q===5){sbf=rbL(b,5);b+=5;}
+      return {start:b,sockOff,sbf};
+    };
+    let tail=walkTail(0);
+    let _mainList=_readPropList(buf,byteOff,tail.start);
+    if(q>=4&&q<=8&&!item.runeword){
+      const groups=q===4?_magicAffixStatIds(r._prefixId,r._suffixId)
+        :q===5?_txtItemStatIds(SET_ITEM_MODS[r.setId])
+        :q===7?_txtItemStatIds(UNIQUE_ITEM_MODS[r.uniqueId])
+        :_rareAffixStatIds(r.rareAffixes);
+      const blockTail=walkTail(D2RR_EXTRA_HEADER_BITS);
+      const chk=_checkPropListPosition(buf,byteOff,_mainList,blockTail.start,groups);
       _mainList=chk.list;
       if(chk.unreliable)r.propListUnreliable=true;
+      else if(_mainList.startBit>=blockTail.start)tail=blockTail;
     }
+    r.numSocketsBitOff=tail.sockOff;
+    const sbf=tail.sbf;
     r.mainPropListStartBit=_mainList.startBit;
     r.mainPropListEndBit=_mainList.endBit;
     r.mods=r.propListUnreliable?[]:_mainList.mods;r._baseModCount=r.mods.length;bit=_mainList.endBit;
-    if(q===5){r.setBonusMods=[];for(let fi=0;fi<5;fi++){if(sbf&(1<<fi)){const {mods:bm,endBit:eb}=_readPropList(buf,byteOff,bit);r.setBonusMods.push({pieces:fi+2,mods:bm});bit=eb;}}}
+    // An unplaced main list leaves the set-bonus lists unplaced too.
+    if(q===5&&!r.propListUnreliable){r.setBonusMods=[];for(let fi=0;fi<5;fi++){if(sbf&(1<<fi)){const {mods:bm,endBit:eb}=_readPropList(buf,byteOff,bit);r.setBonusMods.push({pieces:fi+2,mods:bm});bit=eb;}}}
     if(item.runeword){const {mods:rm,endBit:re}=_readPropList(buf,byteOff,bit);r._rwModCount=rm.length;r.mods=r.mods.concat(rm);bit=re;}
   }catch(e){r.decodeError=e.message;}
   // Expose the final bit position — useful for cascade-delete to know where the parent's
@@ -12789,10 +12864,9 @@ function buildItemTooltipHtml(item, options) {
   // Runewords use txt resolution (their binary property list is empty in D2RR).
   const isRuneword = !!item.runeword;
   const hasBinaryMods = item._mods && item._mods.length && !isRuneword;
-  // Magic items whose prop list couldn't be located fall back to the affix ranges
-  // (uniques already use their txt ranges; an unreliable one has no binary mods).
+  // Items whose prop list couldn't be located fall back to the txt ranges.
   const useTxtPrimary = resolved.lines.length > 0 && (decodedQual === 5 || decodedQual === 7 || isRuneword
-    || (decodedQual === 4 && item._propListUnreliable));
+    || item._propListUnreliable);
 
   if(hasBinaryMods){
     // Show all actual rolled values from binary — one unified list
@@ -17044,8 +17118,7 @@ function _ssHandTier(item) {
 // Highest levelreq across an item's rolled affixes. This is the only source of
 // a required level for charms and jewels — their base rows list levelreq 0 —
 // so it has to come from magicprefix/magicsuffix.txt. Rare/crafted items store
-// up to 6 affixes; slots 0-2 index the prefix table, 3-5 the suffix table
-// (same convention resolveRareMods uses).
+// up to 6 affixes, prefixes and suffixes interleaved (see _rareAffixTable).
 function _ssAffixLevelReq(item) {
   let lvl = 0;
   const bump = (table, id) => {
@@ -17055,7 +17128,7 @@ function _ssAffixLevelReq(item) {
   bump(MAGIC_PREFIX_MODS, item._prefixId);
   bump(MAGIC_SUFFIX_MODS, item._suffixId);
   for (const a of (item._rareAffixes || [])) {
-    bump(a.slot < 3 ? MAGIC_PREFIX_MODS : MAGIC_SUFFIX_MODS, a.id);
+    bump(_rareAffixTable(a.slot), a.id);
   }
   return lvl;
 }
