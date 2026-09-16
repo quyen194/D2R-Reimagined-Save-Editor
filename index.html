@@ -11903,6 +11903,7 @@ function ensureItemProps(item) {
   if (ext.rareNameId1 !== undefined) item._rareNameId1 = ext.rareNameId1;
   if (ext.rareNameId2 !== undefined) item._rareNameId2 = ext.rareNameId2;
   item._mods = ext.mods || [];
+  item._propListUnreliable = !!ext.propListUnreliable;
   if (ext.setBonusMods) item._setBonusMods = ext.setBonusMods;
   // Compute enchant count from counter stats (392-395) — simple label only, no mod splitting
   item._enchantCount = 0;
@@ -11961,6 +11962,7 @@ function _readPropListAt(buf, byteOff, startBit) {
   const rbL=(b,n)=>{let v=0;for(let i=0;i<n;i++){const p=byteOff*8+b+i;v|=((buf[p>>3]>>(p&7))&1)<<i;}return v;};
   let terminated=false;
   let consecInvalid=0;
+  let skipped=0; // zero-save-bit IDs passed over; the game never writes these
   for(let g=0;g<300;g++){
     if(bit+9>buf.length*8)break;
     const id=rbL(bit,9);bit+=9;
@@ -11970,6 +11972,7 @@ function _readPropListAt(buf, byteOff, startBit) {
     if(!sb){
       // sb=0: stat ID exists in itemstatcost but has no stored value.
       // Track consecutive such stats — too many means we've drifted past the real prop list.
+      skipped++;
       consecInvalid++;
       if(consecInvalid>=3)break;
       continue;
@@ -12009,7 +12012,7 @@ function _readPropListAt(buf, byteOff, startBit) {
     }
     mods.push({id,param,stored,value,value2,value3,paramBitOff,valueBitOff,valueBits:sb,paramBits:pb,saveAdd:saveAddP});
   }
-  return {mods,endBit:bit,terminated};
+  return {mods,endBit:bit,terminated,skipped};
 }
 
 // Public prop-list reader with alignment recovery.
@@ -12027,6 +12030,62 @@ function _readPropList(buf, byteOff, startBit) {
     return { ...shifted, startBit: startBit + 1 };
   }
   return { ...primary, startBit };
+}
+
+// Stat IDs each of a magic item's affixes can place in its property list:
+// one Set per present affix (prefix, suffix) that maps to at least one stat.
+function _magicAffixStatIds(prefixId, suffixId) {
+  const groups = [];
+  for (const affix of [MAGIC_PREFIX_MODS[prefixId], MAGIC_SUFFIX_MODS[suffixId]]) {
+    if (!affix) continue;
+    const ids = new Set();
+    for (const mod of affix.mods) {
+      // Both bounds: _addStatEntry drops a value its save bits can't hold.
+      for (const mode of ['min', 'max']) {
+        for (const e of propCodeToStatEntries(mod.code, mod.min, mod.max, mod.param, mode)) ids.add(e.id);
+      }
+    }
+    if (ids.size) groups.push(ids);
+  }
+  return groups;
+}
+
+// D2RR V105 items carry a fixed 128-bit (16-byte) block the header walk above
+// doesn't know about, so the property list really starts 128 bits later than
+// the vanilla layout says. Measured across a full save: of the items whose
+// property list can be pinned down by the next item's offset, 128 is by far
+// the most common gap (43 of 58), and the assumed position almost never works.
+// Advanced-stack items land at 129 because of the extra 1-bit pad the decoder
+// already handles separately.
+const D2RR_EXTRA_HEADER_BITS = 128;
+
+// Magic-item prop-list sanity check. The header walk in decodeItemProperties
+// assumes the vanilla layout, but many D2RR V105 items carry extra bits before
+// the property list, so the walk can start early and still hit a stray 511 by
+// coincidence — a small charm "of Life" (+7 Life in game) decoded as five
+// random stats. So check the decode against the affixes: a plausible list
+// terminates cleanly, skips no zero-save-bit IDs, and carries at least one
+// stat from every affix. Stats the affixes don't explain are allowed — D2RR
+// adds its own (grand charms carry item_addexperience, charms charm_weight).
+// If the first decode isn't plausible, retry past the 128-bit block, measured
+// from `assumedStart` (where the header walk ended) rather than from the
+// primary decode — _readPropList's one-bit alignment recovery may have moved
+// that one, which would carry the same one-bit error into the retry. The +1
+// variant covers items that do have that one-bit gap. The returned startBit
+// feeds the Item Editor's splice, which copies every bit before it verbatim,
+// so the unknown block survives an edit.
+// `unreliable` means no decode was plausible: callers must not trust `list`.
+function _checkMagicPropList(buf, byteOff, primary, assumedStart, prefixId, suffixId) {
+  const groups = _magicAffixStatIds(prefixId, suffixId);
+  if (!groups.length) return { list: primary, unreliable: false };
+  const plausible = (list) => list && list.terminated && !list.skipped
+    && groups.every(g => list.mods.some(m => g.has(m.id)));
+  if (plausible(primary)) return { list: primary, unreliable: false };
+  for (const start of [assumedStart + D2RR_EXTRA_HEADER_BITS, assumedStart + D2RR_EXTRA_HEADER_BITS + 1]) {
+    const cand = _readPropListAt(buf, byteOff, start);
+    if (plausible(cand)) return { list: { ...cand, startBit: start }, unreliable: false };
+  }
+  return { list: primary, unreliable: true };
 }
 
 function decodeItemProperties(buf, byteOff, item) {
@@ -12094,10 +12153,15 @@ function decodeItemProperties(buf, byteOff, item) {
     r.numSocketsBitOff = bit;  // 4-bit numSockets field lives here (or would, if socketed=1)
     if(item.socketed)bit+=4;
     let sbf=0;if(q===5){sbf=rbL(bit,5);bit+=5;}
-    const _mainList=_readPropList(buf,byteOff,bit);
+    let _mainList=_readPropList(buf,byteOff,bit);
+    if(q===4&&!item.runeword){
+      const chk=_checkMagicPropList(buf,byteOff,_mainList,bit,r._prefixId,r._suffixId);
+      _mainList=chk.list;
+      if(chk.unreliable)r.propListUnreliable=true;
+    }
     r.mainPropListStartBit=_mainList.startBit;
     r.mainPropListEndBit=_mainList.endBit;
-    r.mods=_mainList.mods;r._baseModCount=_mainList.mods.length;bit=_mainList.endBit;
+    r.mods=r.propListUnreliable?[]:_mainList.mods;r._baseModCount=r.mods.length;bit=_mainList.endBit;
     if(q===5){r.setBonusMods=[];for(let fi=0;fi<5;fi++){if(sbf&(1<<fi)){const {mods:bm,endBit:eb}=_readPropList(buf,byteOff,bit);r.setBonusMods.push({pieces:fi+2,mods:bm});bit=eb;}}}
     if(item.runeword){const {mods:rm,endBit:re}=_readPropList(buf,byteOff,bit);r._rwModCount=rm.length;r.mods=r.mods.concat(rm);bit=re;}
   }catch(e){r.decodeError=e.message;}
@@ -12625,7 +12689,9 @@ function buildItemTooltipHtml(item, options) {
   // Runewords use txt resolution (their binary property list is empty in D2RR).
   const isRuneword = !!item.runeword;
   const hasBinaryMods = item._mods && item._mods.length && !isRuneword;
-  const useTxtPrimary = resolved.lines.length > 0 && (decodedQual === 5 || decodedQual === 7 || isRuneword);
+  // Magic items whose prop list couldn't be located fall back to the affix ranges.
+  const useTxtPrimary = resolved.lines.length > 0 && (decodedQual === 5 || decodedQual === 7 || isRuneword
+    || (decodedQual === 4 && item._propListUnreliable));
 
   if(hasBinaryMods){
     // Show all actual rolled values from binary — one unified list
@@ -13552,6 +13618,8 @@ window.openItemEditor = function(byteOffset) {
   let ext;
   try { ext = decodeItemProperties(buf, item.byteOffset, item); }
   catch (e) { showPopup(L('ui_edit_decode_failed','Could not decode item properties.')); return; }
+  // The prop list's position is unknown, so any write would land on the wrong bits.
+  if (ext && ext.propListUnreliable) { showPopup(L('ui_edit_decode_failed','Could not decode item properties.')); return; }
   const mods = (ext && ext.mods) || [];
   // White items with no props ARE allowed — that's the entry point for
   // promoting a freshly-rolled white into magic / rare via the Add flow.
