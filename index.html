@@ -8604,7 +8604,10 @@ function parseD2S(buf) {
 // length from the gap to the next offset, such a hit also cuts its host record
 // short. Drop a hit only when it lands inside an item whose end is known: one
 // whose property list passed the position check (magic, rare, set, unique,
-// crafted), so a misdecoded item can never hide the real item after it.
+// crafted), so a misdecoded item can never hide the real item after it. Also
+// drop a hit whose quality is outside 1-8: the field sits at a fixed position
+// ahead of every variable-length one, so a real item always reads a valid one
+// (a "quality 10" set of throwing spikes turned up inside a Tome of Identify).
 // `items` must be in byte order.
 function _dropScanHitsInsideItems(buf, items) {
   const kept = [];
@@ -8614,15 +8617,19 @@ function _dropScanHitsInsideItems(buf, items) {
       console.warn(`parseD2S: dropped scan hit ${it.typeCode} at byte ${it.byteOffset}, inside the item before it`);
       continue;
     }
+    if (it.simple) { kept.push(it); continue; }
+    let ext = null;
+    try { ext = decodeItemProperties(buf, it.byteOffset, it); } catch (_) {}
+    const q = ext && ext.quality;
+    if (ext && !ext.simple && !ext.skippedAdvStack && !ext.decodeError && !(q >= 1 && q <= 8)) {
+      console.warn(`parseD2S: dropped scan hit ${it.typeCode} at byte ${it.byteOffset}, quality ${q}`);
+      continue;
+    }
     kept.push(it);
-    if (it.simple || it.runeword) continue;
-    try {
-      const ext = decodeItemProperties(buf, it.byteOffset, it);
-      const q = ext && ext.quality;
-      if (q >= 4 && q <= 8 && !ext.propListUnreliable && !ext.decodeError && ext.endBit) {
-        trustedEnd = it.byteOffset + Math.ceil(ext.endBit / 8);
-      }
-    } catch (_) {}
+    if (it.runeword || !ext) continue;
+    if (q >= 4 && q <= 8 && !ext.propListUnreliable && !ext.decodeError && ext.endBit) {
+      trustedEnd = it.byteOffset + Math.ceil(ext.endBit / 8);
+    }
   }
   return kept;
 }
@@ -12276,6 +12283,30 @@ function _checkPropListPosition(buf, byteOff, primary, blockStart, groups) {
   return best ? { list: best, unreliable: false } : { list: primary, unreliable: true };
 }
 
+// Position check for items with no txt row to check against: normal, superior
+// and low-quality items, and runewords (whose stats sit in a second list after
+// the main one). A clean read terminates and skips no zero-save-bit IDs; a
+// runeword also needs a clean, non-empty runeword list right after. Past the
+// block comes first — misc items land one bit later (a Tome of Town Portal,
+// a Horadric Cube), everything else on it (a Nadir helm: empty main list, then
+// exactly the stats the game shows) — and the header walk's position last.
+// `unreliable` as in _checkPropListPosition.
+function _checkPlainPropListPosition(buf, byteOff, primary, blockStart, runeword) {
+  const clean = (list) => list.terminated && !list.skipped;
+  const candidates = [blockStart, blockStart + 1]
+    .map(start => ({ ..._readPropListAt(buf, byteOff, start), startBit: start }));
+  candidates.push(primary);
+  for (const list of candidates) {
+    if (!clean(list)) continue;
+    if (runeword) {
+      const rw = _readPropListAt(buf, byteOff, list.endBit);
+      if (!clean(rw) || !rw.mods.length) continue;
+    }
+    return { list, unreliable: false };
+  }
+  return { list: primary, unreliable: true };
+}
+
 function decodeItemProperties(buf, byteOff, item) {
   if(item.simple||item.isVirtual||item.byteOffset<0)return{simple:true,mods:[]};
   // Quest / event / specialty-stash items that don't have rolled properties.
@@ -12332,7 +12363,7 @@ function decodeItemProperties(buf, byteOff, item) {
     if(item.runeword)bit+=16; // runeword padding (name resolved by matching socketed runes)
     if(item.personalized){for(let i=0;i<50;i++){const c=rbL(bit,7);bit+=7;if(!c)break;}}
     const tc=(item.typeCode||'').slice(0,3).toLowerCase();
-    if(tc==='tbk'||tc==='tsc')bit+=5;
+    if(tc==='tbk'||tc==='ibk')bit+=5; // both tomes; their scrolls are compact items
     bit+=1; // timestamp
     const isArm=ARMOR_SET.has(code), isWep=WEAPON_SET.size?WEAPON_SET.has(code):(!ARMOR_SET.has(code)&&!STACK_SET.has(code)&&!MISC_SET.has(code)&&code.length===3);
     const hasQty=STACK_SET.has(code)||STACK_WEAPON_SET.has(code);
@@ -12352,17 +12383,22 @@ function decodeItemProperties(buf, byteOff, item) {
     };
     let tail=walkTail(0);
     let _mainList=_readPropList(buf,byteOff,tail.start);
-    if(q>=4&&q<=8&&!item.runeword){
+    const blockTail=walkTail(D2RR_EXTRA_HEADER_BITS);
+    let chk;
+    if(item.runeword||q<4||q>8){
+      // No txt row to check these against: take the first position whose
+      // lists read cleanly, past the block first.
+      chk=_checkPlainPropListPosition(buf,byteOff,_mainList,blockTail.start,!!item.runeword);
+    }else{
       const groups=q===4?_magicAffixStatIds(r._prefixId,r._suffixId)
         :q===5?_txtItemStatIds(SET_ITEM_MODS[r.setId])
         :q===7?_txtItemStatIds(UNIQUE_ITEM_MODS[r.uniqueId])
         :_rareAffixStatIds(r.rareAffixes);
-      const blockTail=walkTail(D2RR_EXTRA_HEADER_BITS);
-      const chk=_checkPropListPosition(buf,byteOff,_mainList,blockTail.start,groups);
-      _mainList=chk.list;
-      if(chk.unreliable)r.propListUnreliable=true;
-      else if(_mainList.startBit>=blockTail.start)tail=blockTail;
+      chk=_checkPropListPosition(buf,byteOff,_mainList,blockTail.start,groups);
     }
+    _mainList=chk.list;
+    if(chk.unreliable)r.propListUnreliable=true;
+    else if(_mainList.startBit>=blockTail.start)tail=blockTail;
     r.numSocketsBitOff=tail.sockOff;
     const sbf=tail.sbf;
     r.mainPropListStartBit=_mainList.startBit;
@@ -12370,7 +12406,7 @@ function decodeItemProperties(buf, byteOff, item) {
     r.mods=r.propListUnreliable?[]:_mainList.mods;r._baseModCount=r.mods.length;bit=_mainList.endBit;
     // An unplaced main list leaves the set-bonus lists unplaced too.
     if(q===5&&!r.propListUnreliable){r.setBonusMods=[];for(let fi=0;fi<5;fi++){if(sbf&(1<<fi)){const {mods:bm,endBit:eb}=_readPropList(buf,byteOff,bit);r.setBonusMods.push({pieces:fi+2,mods:bm});bit=eb;}}}
-    if(item.runeword){const {mods:rm,endBit:re}=_readPropList(buf,byteOff,bit);r._rwModCount=rm.length;r.mods=r.mods.concat(rm);bit=re;}
+    if(item.runeword&&!r.propListUnreliable){const {mods:rm,endBit:re}=_readPropList(buf,byteOff,bit);r._rwModCount=rm.length;r.mods=r.mods.concat(rm);bit=re;}
   }catch(e){r.decodeError=e.message;}
   // Expose the final bit position — useful for cascade-delete to know where the parent's
   // binary actually ends, so socketed-child filtering can reject scanner false-positives
