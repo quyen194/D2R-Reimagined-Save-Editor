@@ -38,6 +38,8 @@ The editor relies on external data from the D2R Reimagined repository (item data
 - Item rarity coloring and metadata display
 - Tooltip inspection with modifiers and flags
 - Item insertion via categorized modal (weapons, armor, misc, uniques, sets, runewords)
+- Charm Inventory panel for the D2RLoader plugin's separate charm grid (see
+  [Charm Inventory settings](#charm-inventory-settings))
 
 ### Stash & Shared Stash
 - Multi-tab stash support
@@ -127,6 +129,30 @@ On startup, the editor performs:
 4. Fallback to local copies if remote fetch fails
 
 Failure to load required data prevents the editor from initializing.
+
+---
+
+## Charm Inventory settings
+
+The D2RLoader Charm Inventory plugin keeps charms in a grid of its own, outside the normal
+inventory. Saves that use it get an extra panel under the paperdoll on the Inventory tab,
+with the same tooltips, editing, drag & drop and insertion as any other grid.
+
+Its size and visibility come from [`base/charminv.json`](base/charminv.json):
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `version` | number | `1` | Schema version |
+| `enabled` | `true` / `false` / `"auto"` | `"auto"` | `"auto"` shows the panel only for saves that have charms in that grid; `true` always shows it; `false` hides it |
+| `width` | number | `10` | Columns, 1-16 |
+| `height` | number | `4` | Rows, 1-16 |
+
+Sizes stop at 16 because an item's position is stored in 4 bits — no item can sit past
+column or row 16. A field that isn't valid is reported in the browser console and the
+built-in default is kept, so a typo can't take the panel down.
+
+Match `width` and `height` to whatever your plugin is configured for. If they're smaller
+than the plugin's real grid, charms outside the smaller area won't be drawn.
 
 ---
 

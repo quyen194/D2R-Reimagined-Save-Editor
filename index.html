@@ -1253,7 +1253,7 @@ const STRINGS_BASE = 'https://raw.githubusercontent.com/D2R-Reimagined/d2r-reima
 // now hosted as JSON alongside the base/ folder. Falls back to the bundled
 // local copies when GitHub is unreachable (same pattern as the mod txt data).
 const EDITOR_DATA_URL = 'https://raw.githubusercontent.com/GildyBoye/D2R-Reimagined-Save-Editor/main/base/';
-const EDITOR_DATA_FILES = ['item_meta.json', 'templates.json', 'sprites.json', 'wheel.json', 'stat_def.json', 'categories.json', 'autosort.json'];
+const EDITOR_DATA_FILES = ['item_meta.json', 'templates.json', 'sprites.json', 'wheel.json', 'stat_def.json', 'categories.json', 'autosort.json', 'charminv.json'];
 // Actual string JSON files confirmed in the repo
 const STRING_FILES = [
   'item-names.json',         // weapon and armour display names
@@ -1810,6 +1810,11 @@ async function loadEditorData(timeout) {
   // SS_AUTOSORT_BUILTIN in charge, which is the same layout this file ships.
   const autoSort = await _fetchEditorJson('autosort.json', timeout);
   if (autoSort) _ssSetAutoSortBaseConfig(autoSort);
+
+  // charminv.json → the Charm Inventory panel's size and on/off switch. A miss
+  // leaves CHARM_INV_BUILTIN in charge, which is what this file ships.
+  const charmInv = await _fetchEditorJson('charminv.json', timeout);
+  if (charmInv) _charmInvSetBaseConfig(charmInv);
 
   // D2R-Reimagined HD sprite-path mappings — fetched from the mod repo so
   // the editor stays in sync with upstream. Only consumed when the user flips
@@ -9993,13 +9998,82 @@ function itemFlags(item) {
 }
 
 // Item routing — see doc/ITEM-ROUTING.md
+// ═══════════════════════════════════════════════════════════
+//  CHARM INVENTORY (D2RLoader plugin)
+//  A grid the base game doesn't have: charms live at parent=0 /
+//  storage=7 instead of the normal inventory. Its size is the
+//  plugin's to choose, so base/charminv.json carries it and the
+//  defaults below stand in when that file is missing or wrong.
+// ═══════════════════════════════════════════════════════════
+const CHARM_INV_SCHEMA_VERSION = 1;
+const CHARM_INV_STORAGE = 7;
+// x and y are 4-bit fields in the item header, so nothing can address
+// a cell past 15 no matter what the config file asks for.
+const CHARM_INV_MAX_DIM = 16;
+const CHARM_INV_BUILTIN = { version: CHARM_INV_SCHEMA_VERSION, enabled: 'auto', width: 10, height: 4 };
+let _charmInvConfig = { ...CHARM_INV_BUILTIN };
+
+// Merge base/charminv.json over the built-in defaults. Every field is checked
+// on its own: a bad value is reported and the default kept, so one typo can't
+// take the panel down.
+function _charmInvSetBaseConfig(raw) {
+  const out = { ...CHARM_INV_BUILTIN };
+  const warn = (msg) => console.warn(`charminv.json: ${msg}`);
+  if (raw && typeof raw === 'object') {
+    if ('version' in raw && raw.version !== CHARM_INV_SCHEMA_VERSION) {
+      warn(`version ${JSON.stringify(raw.version)} is not ${CHARM_INV_SCHEMA_VERSION} — loading it anyway.`);
+    }
+    if ('enabled' in raw) {
+      if (raw.enabled === true || raw.enabled === false || raw.enabled === 'auto') out.enabled = raw.enabled;
+      else warn(`enabled must be true, false or "auto" — kept ${JSON.stringify(out.enabled)}.`);
+    }
+    for (const key of ['width', 'height']) {
+      if (!(key in raw)) continue;
+      const n = parseInt(raw[key], 10);
+      if (Number.isFinite(n) && n >= 1 && n <= CHARM_INV_MAX_DIM) out[key] = n;
+      else warn(`${key} must be a whole number from 1 to ${CHARM_INV_MAX_DIM} — kept ${out[key]}.`);
+    }
+  } else {
+    warn('not an object — using the built-in defaults.');
+  }
+  _charmInvConfig = out;
+}
+
+function getCharmInvDimensions() {
+  return { w: _charmInvConfig.width, h: _charmInvConfig.height };
+}
+
+// "auto" shows the panel only for saves that actually use the plugin, so the
+// grid doesn't sit there empty for players who don't run it.
+function isCharmInvEnabled(charmItems) {
+  if (_charmInvConfig.enabled === true)  return true;
+  if (_charmInvConfig.enabled === false) return false;
+  return !!(charmItems && charmItems.length);
+}
+
+// Grid an insert or a drop is landing in. Charm Inventory carries its own
+// size; everything else follows the character's inventory / stash dimensions.
+function getGridDimsForMode(mode, cls) {
+  if (mode === 'charminv') return getCharmInvDimensions();
+  const dims = getInventoryDimensions(cls);
+  return mode === 'inventory' ? { w: dims.invW, h: dims.invH } : { w: dims.stashW, h: dims.stashH };
+}
+
+// Default storage for an insert context that didn't name one.
+function getStorageForMode(mode) {
+  if (mode === 'inventory') return 1;
+  if (mode === 'charminv')  return CHARM_INV_STORAGE;
+  return 5;
+}
+
 function getItemsByLocation() {
   const equipped      = {};           // equipSlot -> item
   const inventory     = [];           // personal inventory (10×8), storage=1
   const cubeItems     = [];           // inside Horadric Cube, storage=4
   const personalStash = [];           // personal stash, storage=5
   const belt          = [];           // belt slots, parent=2
-  const special       = [];           // quest items
+  const charmInv      = [];           // Charm Inventory plugin grid, storage=7
+  const special       = [];           // anything stored somewhere we don't map
   const merc          = [];
 
   for (const item of (parsedChar.items || [])) {
@@ -10029,14 +10103,14 @@ function getItemsByLocation() {
     if (storage === 4) { cubeItems.push(item); continue; }
     // storage=5: personal stash
     if (storage === 5) { personalStash.push(item); continue; }
-    // storage=7: quest items
-    if (storage === 7) { special.push(item); continue; }
+    // storage=7: the D2RLoader Charm Inventory plugin's grid
+    if (storage === CHARM_INV_STORAGE) { charmInv.push(item); continue; }
 
     // Anything else: show as special
     special.push(item);
   }
 
-  return { equipped, inventory, cubeItems, personalStash, belt, special, merc };
+  return { equipped, inventory, cubeItems, personalStash, belt, charmInv, special, merc };
 }
 
 // Build a CSS-grid inventory panel with items spanning their correct w×h cells
@@ -11168,7 +11242,7 @@ function _buildBuildsPanelHtml() {
 function renderInventory(c) {
   if (!parsedChar.items) parsedChar.items = [];
 
-  const { equipped, inventory, belt } = getItemsByLocation();
+  const { equipped, inventory, belt, charmInv } = getItemsByLocation();
   const dims = getInventoryDimensions(parsedChar.header.cls);
 
   let html = saveBar('Click items to inspect or remove. Use empty cells to insert new items.');
@@ -11177,11 +11251,13 @@ function renderInventory(c) {
     ...Object.values(equipped || {}),
     ...(inventory || []),
     ...(belt || []),
+    ...(charmInv || []),
   ];
   const invLocate = (it) => {
     const p = it.parent ?? it.location ?? 0;
     if (p === 1) return L('ui_search_loc_equipped','Equipped');
     if (p === 2) return L('ui_search_loc_belt','Belt');
+    if ((it.storage ?? 0) === CHARM_INV_STORAGE) return L('ui_search_loc_charminv','Charm Inventory');
     return L('ui_search_loc_inventory','Inventory');
   };
   const invHits = findItemSearchHits(invSearchItems, _invSearchQuery, invLocate);
@@ -11372,6 +11448,17 @@ function renderInventory(c) {
   // later, so swapping loadouts (e.g. MF gear vs main set) is one click.
   const buildsHtml = _buildBuildsPanelHtml();
 
+  // Charm Inventory — the D2RLoader plugin's grid (storage=7), which the base
+  // game has no equivalent of. Sits below the paperdoll row, full width, and
+  // stays hidden for saves that don't use the plugin (see isCharmInvEnabled).
+  const charmDims = getCharmInvDimensions();
+  const charmPanelHtml = isCharmInvEnabled(charmInv) ? `
+    <div style="margin-top:16px">
+      ${h2(L('ui_charm_inventory','Charm Inventory') + ` (${charmDims.w}×${charmDims.h})`)}
+      ${buildInvGrid(charmInv, charmDims.w, charmDims.h, INV_CELL, {mode:'charminv', storage:CHARM_INV_STORAGE})}
+      ${charmInv.length === 0 ? '<p class="note" style="margin-top:4px">Empty</p>' : ''}
+    </div>` : '';
+
   c.innerHTML = html + `
     <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap">
       <div style="flex-shrink:0">
@@ -11387,6 +11474,7 @@ function renderInventory(c) {
       </div>
       ${buildsHtml}
     </div>
+    ${charmPanelHtml}
     `;
   // Clear the one-shot search highlight — the CSS pulse animation still plays
   // on the element we just rendered, but subsequent re-renders won't retrigger.
@@ -13052,7 +13140,7 @@ function _itemEditResolveItem(byteOffset) {
   if (!parsedChar?.items) return null;
   const it = parsedChar.items.find(x => x.byteOffset === byteOffset);
   if (!it) return null;
-  if (it.isMerc || (it.storage !== 1 && it.storage !== 5)) {
+  if (it.isMerc || (it.storage !== 1 && it.storage !== 5 && it.storage !== CHARM_INV_STORAGE)) {
     return { reject: 'location' };
   }
   if (_itemEditTypeReason(it)) {
@@ -15598,11 +15686,11 @@ window.confirmInsertItem = function() {
   const ilvl = (isRune || isMiscItem) ? 1 : Math.max(1, Math.min(99, ilvlRaw));
 
   // ── Inventory/stash collision check ──
-  if (ctx.mode === 'inventory' || ctx.mode === 'stash') {
-    const storage = ctx.storage || (ctx.mode === 'inventory' ? 1 : 5);
-    const dims = getInventoryDimensions(parsedChar.header.cls);
-    const gridW = ctx.mode === 'inventory' ? dims.invW : dims.stashW;
-    const gridH = ctx.mode === 'inventory' ? dims.invH : dims.stashH;
+  if (ctx.mode === 'inventory' || ctx.mode === 'stash' || ctx.mode === 'charminv') {
+    const storage = ctx.storage || getStorageForMode(ctx.mode);
+    const gridDims = getGridDimsForMode(ctx.mode, parsedChar.header.cls);
+    const gridW = gridDims.w;
+    const gridH = gridDims.h;
     const ix = ctx.x, iy = ctx.y;
 
     // Check bounds
@@ -15703,10 +15791,10 @@ window.confirmInsertItem = function() {
     newItem.storage  = 1;      // inventory
     newItem.x = ctx.x; newItem.y = ctx.y;
     newItem.equipSlot = 0;
-  } else if (ctx.mode === 'stash') {
+  } else if (ctx.mode === 'stash' || ctx.mode === 'charminv') {
     newItem.parent   = 0;
     newItem.location = 0;
-    newItem.storage  = ctx.storage;
+    newItem.storage  = ctx.storage || getStorageForMode(ctx.mode);
     newItem.x = ctx.x; newItem.y = ctx.y;
     newItem.equipSlot = 0;
   }
@@ -15743,10 +15831,10 @@ function insertRunewordRunes(entry, ctx) {
     return;
   }
 
-  const storage = ctx.storage || (ctx.mode === 'inventory' ? 1 : 5);
-  const dims = getInventoryDimensions(parsedChar.header.cls);
-  const gridW = ctx.mode === 'inventory' ? dims.invW : dims.stashW;
-  const gridH = ctx.mode === 'inventory' ? dims.invH : dims.stashH;
+  const storage = ctx.storage || getStorageForMode(ctx.mode);
+  const gridDims = getGridDimsForMode(ctx.mode, parsedChar.header.cls);
+  const gridW = gridDims.w;
+  const gridH = gridDims.h;
 
   // Bounds check
   let maxDx = 0, maxDy = 0;
