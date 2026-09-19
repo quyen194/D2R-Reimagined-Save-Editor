@@ -1538,6 +1538,15 @@ function fetchTimed(url, ms=12000) {
     .catch(err => { clearTimeout(timer); throw err; });
 }
 
+async function fetchFirstSource(file, sources) {
+  let lastErr;
+  for (const [url, tag, ms] of sources) {
+    try { return { res: await fetchTimed(url + file, ms), tag }; }
+    catch (err) { lastErr = err; }
+  }
+  throw lastErr;
+}
+
 // ── Fallback base path (local copies bundled alongside index.html) ──
 const BASE_FALLBACK_URL  = './base/';
 const STR_FALLBACK_URL   = './base/strings/';
@@ -1613,10 +1622,13 @@ async function startBaseFileLoad() {
     const file = ALL_FILES[i];
     document.getElementById('progressBar').style.width = Math.round((i+1)/total*100)+'%';
     document.getElementById('loadingSub').textContent  = `Fetching ${file}  (${i+1} / ${total})${usingFallback?' [local]':''}`;
+    const sources = usingFallback
+      ? [[BASE_FALLBACK_URL, ' (local)', timeout]]
+      : [[srcBase, '', timeout], [EDITOR_DATA_URL, ' (editor repo)', 8000], [BASE_FALLBACK_URL, ' (local)', 8000]];
     try {
-      const res = await fetchTimed(srcBase + file, timeout);
+      const { res, tag } = await fetchFirstSource(file, sources);
       baseData[file.replace('.txt','')] = parseTSV(await res.text());
-      addLog('ok', `✓ ${file}${usingFallback?' (local)':''}`);
+      addLog('ok', `✓ ${file}${tag}`);
       successCount++;
     } catch(err) {
       const isAbort = err.name === 'AbortError';
@@ -2713,7 +2725,8 @@ function buildStatListFromMods(mods, useMaxRolls) {
   const byId = new Map();
   for (const mod of mods) {
     if (!mod.code) continue;
-    if (INTERNAL_PROP_CODES.has(mod.code)) continue;
+    // oskill_hide is hidden from tooltips but the game expects it saved (stat 97, e.g. Hidden Charm Passive)
+    if (INTERNAL_PROP_CODES.has(mod.code) && mod.code !== 'oskill_hide') continue;
     // Pass original min/max and the roll flag — propCodeToStatEntries handles rolling per-func
     const entries = propCodeToStatEntries(mod.code, mod.min||0, mod.max||0, mod.par||mod.param||'', useMaxRolls);
     for (const e of entries) {
@@ -3502,8 +3515,9 @@ function buildItemTypeSets() {
   if (weaponData) {
     for (const row of weaponData.rows) {
       const code = (row['code'] || '').trim();
-      if (code) newWeapon.add(code);
-      if (code && (row['stackable'] || '').trim() === '1') newStackWeapon.add(code);
+      if (!code) continue;
+      newWeapon.add(code);
+      if ((row['stackable'] || '').trim() === '1') newStack.add(code);
     }
   }
   const newAdvStack = new Set();
@@ -4972,7 +4986,7 @@ function _snakeSpriteKey(name) {
 // empty — sprite lookups just degrade to text names for those item classes.
 async function loadHdSpriteMappings(timeout) {
   const pull = async (file) => {
-    const urls = [REIMAGINED_HD_URL + file, BASE_FALLBACK_URL + 'sprites/' + file];
+    const urls = [REIMAGINED_HD_URL + file, BASE_FALLBACK_URL + file];
     for (const url of urls) {
       try {
         const res = await fetchTimed(url, timeout);
@@ -4982,12 +4996,15 @@ async function loadHdSpriteMappings(timeout) {
     return null;
   };
 
-  // All three files are now flat `{key: assetPath}` dicts — value is the
-  // direct sprite path string. No wrapper object, no unused uber/ultra fields.
+  // Reimagined publishes [{key: {asset}}] / [{key: {normal,uber,ultra}}];
+  // the bundled base/ fallbacks are flat {key: path}. Accept both.
   const loadSpriteMap = (data, target) => {
-    if (!data || typeof data !== 'object') return;
-    for (const [key, val] of Object.entries(data)) {
-      if (typeof val === 'string') target[key] = val;
+    const entries = Array.isArray(data)
+      ? data.flatMap(o => Object.entries(o || {}))
+      : Object.entries(data || {});
+    for (const [key, val] of entries) {
+      const p = typeof val === 'string' ? val : (val && (val.asset || val.normal));
+      if (typeof p === 'string') target[key] = p;
     }
   };
 
@@ -6340,8 +6357,10 @@ function encodeExtendedItem(item) {
   // D2RR: runes (quality=2) need an extra bit (verified against real game Cham encoding)
   if (isRuneCode) pos += 1;
 
-  // timestamp (1 bit) — 0
-  wbN(pos, 0, 1); pos += 1;
+  // timestamp (1 bit). On rolled quivers this slot is the stackable marker: game-dropped
+  // unique bolts (GildBarb.d2s) carry 0,1 then qty=500; writing 0 crashes the game on join.
+  const isRolledStackMisc = quality >= 3 && !isArmor && !isWeapon && STACK_SET.has(code);
+  wbN(pos, isRolledStackMisc ? 1 : 0, 1); pos += 1;
 
   // compactsave=0 misc items (cube, tomes, gem bag, arrows, etc.) carry a
   // 1-bit "stackable marker" right after the timestamp — set to 1 if a
@@ -6383,13 +6402,21 @@ function encodeExtendedItem(item) {
       }
     }
     wbN(pos, maxDur, 8); pos += 8;
-    // if curDur > 0: max_durability (10 bits, D2R V105)
-    if (maxDur > 0) { wbN(pos, maxDur, 10); pos += 10; }
+    // current durability (10 bits, D2R V105). Top bit is the stackable marker on throwing
+    // weapons (game-written jav/9ts carry it; all other weapons and armor leave it 0).
+    const stackMarker = isWeapon && STACK_SET.has(code) ? 0x200 : 0;
+    if (maxDur > 0) { wbN(pos, maxDur | stackMarker, 10); pos += 10; }
   }
 
   if (STACK_SET.has(code)) {
-    // quantity (9 bits) — 1 for single items
-    wbN(pos, 1, 9); pos += 9;
+    // quantity (9 bits) — 1 by default; rolled quivers and throwing weapons drop as a full stack
+    let qty = 1;
+    const stackTable = isWeapon ? baseData['weapons'] : (isRolledStackMisc ? baseData['misc'] : null);
+    if (stackTable) {
+      const stackRow = stackTable.rows.find(r => (r['code'] || '').trim() === code);
+      qty = Math.min(parseInt((stackRow && stackRow['maxstack']) || '1', 10) || 1, 511);
+    }
+    wbN(pos, qty, 9); pos += 9;
   }
 
   // num_sockets (4 bits) — only present if socketed flag (bit 11) is set
@@ -12056,7 +12083,7 @@ function ensureItemProps(item) {
 //  ITEM PROPERTY DECODER
 //  savebits/saveparambits/followstats from the D2<>D2R converter source.
 // ═══════════════════════════════════════════════════════════
-const SAVE_BITS=[8,7,7,7,0,0,0,9,0,8,0,8,0,0,0,0,9,9,9,10,7,8,9,8,9,8,8,8,8,0,0,11,9,8,6,6,9,9,5,9,5,9,5,9,5,9,5,0,8,9,6,10,8,9,8,9,8,10,10,9,7,0,7,0,0,0,0,7,7,0,0,8,9,8,6,7,6,6,7,9,9,7,9,3,0,9,7,7,1,4,24,8,8,7,7,0,7,6,1,7,0,0,7,0,0,7,0,3,1,9,8,9,7,7,6,1,7,7,1,9,7,9,9,10,10,1,3,3,5,0,0,0,0,0,5,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,5,1,1,7,7,7,7,7,8,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9,9,3,0,0,0,8,8,10,3,10,10,10,10,10,4,7,7,7,7,7,7,7,0,0,16,7,8,8,0,0,0,0,8,8,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,5,6,6,6,6,6,6,6,6,6,6,6,6,0,6,6,8,0,0,0,0,0,0,0,0,0,0,0,0,0,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,0,8,8,8,8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,6,0,0,0,0,9,9,9,9,8,8,8,8,8,7,7,7,8,8,8,8,8,8,8,8,8,0,0,0,0,0,0,2,9,8,0,0,8,8,7,9,9,6,0,8,8,16,16,16,16,16,16,16,7,5,7,7,7,5,7,7,6,16,6,5,5,5,6,8,8,8,8,6,7,7,3,3,3,3,3,2,2,2,2,2,2,2,2,4,7,7,7,7,9,9,8,8,5,5,6,6,6,6,0,0,0,0,6,8,8,16,16,0];
+const SAVE_BITS=[8,7,7,7,0,0,0,9,0,8,0,8,0,0,0,0,9,9,9,10,7,8,9,8,9,8,8,8,8,0,0,11,9,8,6,6,9,9,5,9,5,9,5,9,5,9,5,0,8,9,6,10,8,9,8,9,8,10,10,9,7,0,7,0,0,0,0,7,7,0,0,8,9,8,6,7,6,6,7,9,9,7,9,3,0,9,7,7,1,4,24,8,8,7,7,0,7,6,1,7,0,0,7,0,0,7,0,3,1,9,8,9,7,7,6,1,7,7,1,9,7,9,9,10,10,1,3,3,5,0,0,0,0,0,5,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,5,1,1,7,7,7,7,7,8,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9,9,3,0,0,0,8,8,10,3,10,10,10,10,10,4,7,7,7,7,7,7,7,0,0,16,7,8,8,0,0,0,0,8,8,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,5,6,6,6,6,6,6,6,6,6,6,6,6,0,6,6,8,0,0,0,0,0,0,0,0,0,0,0,0,0,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,22,0,8,8,8,8,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,6,0,0,0,0,9,9,9,9,8,8,8,8,8,7,7,7,8,8,8,8,8,8,8,8,8,0,0,0,0,0,0,2,9,8,0,0,8,8,7,9,9,6,0,8,8,16,16,16,16,16,16,16,7,5,7,7,7,5,7,7,6,16,6,5,5,5,6,8,8,8,8,6,7,7,3,3,3,3,3,2,2,2,2,2,2,2,2,4,7,7,7,7,9,9,8,8,5,5,6,6,6,6,0,0,0,0,6,8,8,16,16,16];
 const SAVE_PARAM_BITS=[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,9,8,0,0,0,0,0,0,0,0,9,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9,0,0,0,10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,10,10,0,0,0,0,0,0,0,16,0,0,0,0,0,0,16,16,16,16,16,0,16,0,0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,16,16,0,16,0,0,0,9,0,0,0,0,0,0,0,0,0,0,0,3,3,3,3,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
 const FOLLOW_STATS=[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,1,0,1,0,2,0,0,2];
 // stat id -> [template, save_add(bias)]  display = stored - save_add
