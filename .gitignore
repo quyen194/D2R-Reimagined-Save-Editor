@@ -1,0 +1,24 @@
+# Local save files used for testing (personal game data)
+*.d2s
+*.d2i
+*.d2x
+*.key
+*.bak
+# ...but keep the bundled base character templates
+!base/basechars/*.d2s
+
+# Tooling / editor state
+.playwright-mcp/
+.vscode/
+.idea/
+.claude/settings.local.json
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs / temp
+*.log
+*.tmp
+node_modules/
