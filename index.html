@@ -17821,6 +17821,13 @@ function _ssBuildSortKey(names) {
 const _ssIsRare = (it) => it.quality === 6;
 const _ssIsUniqueLike = (it) => it.quality === 7 || it.quality === 8;
 
+// Flag bit 4, read straight off the record at parse time — no property decode
+// needed. Compact records (gems, runes, socketed children) do not carry a
+// meaningful identified bit, so they are never "unidentified" for sorting
+// purposes. The 'unidentified' mode matches exactly this, and every other mode
+// excludes exactly this, so the two cannot drift apart.
+const _ssIsUnidentified = (it) => !it.simple && !it.identified;
+
 // ── Sort mode registry ──────────────────────────────────────
 //
 // Each mode declares one or two independent streams. A stream is a filter, a
@@ -17925,6 +17932,23 @@ const SS_SORT_MODES = [
     ],
   },
   ..._ssRingAmuletModes(),
+  {
+    id: 'unidentified',
+    label: () => L('ui_ss_mode_unidentified', 'Unidentified Items'),
+    hint:  () => L('ui_ss_mode_unidentified_hint', 'Everything still unidentified, gathered onto one tab — by slot, then required level.'),
+    noun:  () => L('ui_ss_noun_unidentified', 'unidentified items'),
+    // Deliberately the only mode with no quality or type filter: an
+    // unidentified item is pulled out of whichever category would otherwise
+    // have claimed it (see _ssResolveSortModes), so this one has to be able to
+    // take all of them — rare gear, a magic ring, an unread charm alike.
+    unidentifiedOnly: true,
+    streams: [{
+      id: 'main',
+      match: _ssIsUnidentified,
+      dir: 'row',
+      sortKeys: ['handTier', 'gearGroup', 'quality', 'reqLevel', '-ilvl', 'baseName'],
+    }],
+  },
 ];
 
 // Rings and amulets share one mode per quality tier: rings fill columns from
@@ -17969,11 +17993,31 @@ function _ssResolveSortModes() {
   if (_ssResolvedModes) return _ssResolvedModes;
   const cfg = _ssAutoSortConfig();
   const byId = new Map(cfg.categories.map(c => [c.modeId, c]));
+  const unidCat = byId.get('unidentified');
+  const collectsUnidentified = !!unidCat && unidCat.enabled !== false;
 
   _ssResolvedModes = SS_SORT_MODES.map(mode => {
     const spec = byId.get(mode.id);
     const streams = mode.streams.map(st => {
       const out = { ...st };
+      // An unidentified item belongs to the 'unidentified' category and to
+      // nothing else. Without this every other category still claims it by
+      // quality and type, so it gets laid down early and then pulled back out
+      // by the last step, leaving a hole in an otherwise dense layout.
+      // Applied here rather than inside each mode's own match because the
+      // planner calls `stream.match` directly as well as through
+      // _ssModeMatches, and this is the one place both of them come from.
+      //
+      // Gated on the category actually being in the effective layout. The step
+      // lives in base/autosort.json and the exclusion lives here, and those two
+      // are fetched independently — an older config file (or a user who turned
+      // the category off) would otherwise leave every unidentified item
+      // diverted out of its normal category with nothing left to collect it,
+      // stranding them instead of sorting them. No category, no diversion.
+      if (!mode.unidentifiedOnly && collectsUnidentified) {
+        const inner = st.match;
+        out.match = (it) => !_ssIsUnidentified(it) && inner(it);
+      }
       if (st.sortKeys) {
         const names = (spec && spec.sortKeys) ? spec.sortKeys : st.sortKeys;
         const built = _ssBuildSortKey(names);
@@ -18719,6 +18763,7 @@ const SS_AUTOSORT_BUILTIN = {
     { modeId: 'rareMagicJewel', minTabs: 1, enabled: true, addEmptyPageWhen: null, sortKeys: null, fill: null },      // tab 13
     { modeId: 'set',            minTabs: 6, enabled: true, addEmptyPageWhen: 0, sortKeys: null, fill: null },         // tabs 14-19
     { modeId: 'rareGear',       minTabs: 1, enabled: true, addEmptyPageWhen: 'never', sortKeys: null, fill: null },   // tab 20 onwards
+    { modeId: 'unidentified',   minTabs: 1, enabled: true, addEmptyPageWhen: 'never', sortKeys: null, fill: null },   // the tab after rare gear
   ],
 };
 

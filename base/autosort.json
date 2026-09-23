@@ -25,6 +25,7 @@
     { "modeId": "uniqueJewel",    "minTabs": 1, "enabled": true },
     { "modeId": "rareMagicJewel", "minTabs": 1, "enabled": true },
     { "modeId": "set",            "minTabs": 6, "enabled": true, "addEmptyPageWhen": "always" },
-    { "modeId": "rareGear",       "minTabs": 1, "enabled": true, "addEmptyPageWhen": "never" }
+    { "modeId": "rareGear",       "minTabs": 1, "enabled": true, "addEmptyPageWhen": "never" },
+    { "modeId": "unidentified",   "minTabs": 1, "enabled": true, "addEmptyPageWhen": "never" }
   ]
 }
