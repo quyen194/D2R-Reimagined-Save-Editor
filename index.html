@@ -12242,6 +12242,10 @@ function _rareAffixStatIds(rareAffixes) {
 // ("Hidden Charm Passive") on socketed set weapons, charm-property
 // (charm_weight) on pierce-immunity grand charms.
 const _OPTIONAL_TXT_PROPS = new Set(['oskill_hide', 'charm-property', 'uberstone-property']);
+// How many stats a partially-matching property-list decode may carry that no
+// declared group explains. See _checkPropListPosition for the measurement this
+// comes from: correct decodes scored 0-2, the known-wrong one scored 7.
+const D2RR_PARTIAL_MAX_UNEXPLAINED = 2;
 function _txtItemStatIds(entry) {
   if (!entry) return [];
   const groups = [];
@@ -12296,15 +12300,58 @@ function _checkPropListPosition(buf, byteOff, primary, blockStart, groups) {
   const known = new Set();
   for (const g of groups) for (const id of g) known.add(id);
   const has = (list, g) => list.mods.some(m => _modStatIds(m).some(id => g.has(id)));
+  // blockStart - 1 is here because a q=4 item's trailing gap is not always
+  // present: "Long Bow of Evisceration" carries its one real stat
+  // (secondary_maxdamage 51, exactly the +51 Maximum Weapon Damage the game
+  // shows) one bit AHEAD of the walk's landing point, and passes every group
+  // check once it is read there. Ordered after the other two so it only ever
+  // wins by being strictly better.
   const candidates = [primary];
-  for (const start of [blockStart, blockStart + 1]) {
+  for (const start of [blockStart, blockStart + 1, blockStart - 1]) {
+    if (start < 0) continue;
     candidates.push({ ..._readPropListAt(buf, byteOff, start), startBit: start });
   }
-  let best = null, bestUnexplained = Infinity;
+  let best = null, bestMatched = -1, bestUnexplained = Infinity;
   for (const list of candidates) {
-    if (!list.terminated || list.skipped || !required.every(g => has(list, g))) continue;
+    if (!list.terminated || list.skipped) continue;
+    const matched = required.reduce((n, g) => n + (has(list, g) ? 1 : 0), 0);
     const unexplained = list.mods.filter(m => !_modStatIds(m).some(id => known.has(id))).length;
-    if (unexplained < bestUnexplained) { best = list; bestUnexplained = unexplained; }
+    // Requiring EVERY group was too strict: a D2RR item does not always roll
+    // every property its txt row declares. "Eye of Heaven" (dr4, unique 1288)
+    // declares 8 and the game shows 5 — the three missing ones are
+    // item_singleskill twice and passive_cold_mastery — so a decode that
+    // reproduces the tooltip exactly, terminates cleanly and skips nothing was
+    // being thrown away and the item marked undecodable. Same for xtu
+    // (item_pierce), ned (extra_bonespears), tkf and sbw
+    // (item_maxdamage_percent). _OPTIONAL_TXT_PROPS was the old workaround and
+    // it cannot keep up: the property that goes missing differs per item.
+    //
+    // A full match is still trusted outright. A partial one has to clear both
+    // bars below. They are deliberately CONSERVATIVE rather than tuned: across
+    // seven records whose real property-list position was established from
+    // in-game tooltips, every correct decode scored 0-2 unexplained stats and
+    // matched at least half its groups, so these bars admit every case that was
+    // verified and nothing beyond it.
+    //
+    // They are not a characterisation of what a wrong decode looks like — no
+    // wrong decode has actually been caught in the act. Three later records
+    // (ne8@86846 1/3 groups, drf@9819 1/9, rin@86946 5 unexplained) turned out
+    // to be correct too and are rejected here purely for want of evidence, and
+    // a candidate first written off as garbage (cqv@31257) proved to be the
+    // truth as well — its "extra" stats are the secondary_ and throw_ damage
+    // variants a quiver writes alongside the plain pair, exactly as
+    // _DAMAGE_STAT_ALIASES describes. So treat these numbers as a floor that
+    // future evidence should raise, not as a boundary that means anything.
+    //
+    // Staying strict here is the safe direction. An unreliable flag only costs
+    // the item its stat display and hands the record to the boundary solver's
+    // search; a wrongly accepted list makes primaryLen confidently wrong, and
+    // a confidently wrong length is what cuts a record in half.
+    if (matched < required.length
+        && !(unexplained <= D2RR_PARTIAL_MAX_UNEXPLAINED && matched * 2 >= required.length)) continue;
+    if (matched > bestMatched || (matched === bestMatched && unexplained < bestUnexplained)) {
+      best = list; bestMatched = matched; bestUnexplained = unexplained;
+    }
   }
   return best ? { list: best, unreliable: false } : { list: primary, unreliable: true };
 }
