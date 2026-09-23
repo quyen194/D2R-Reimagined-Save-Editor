@@ -12433,6 +12433,27 @@ function decodeItemProperties(buf, byteOff, item) {
     // An unplaced main list leaves the set-bonus lists unplaced too.
     if(q===5&&!r.propListUnreliable){r.setBonusMods=[];for(let fi=0;fi<5;fi++){if(sbf&(1<<fi)){const {mods:bm,endBit:eb}=_readPropList(buf,byteOff,bit);r.setBonusMods.push({pieces:fi+2,mods:bm});bit=eb;}}}
     if(item.runeword&&!r.propListUnreliable){const {mods:rm,endBit:re}=_readPropList(buf,byteOff,bit);r._rwModCount=rm.length;r.mods=r.mods.concat(rm);bit=re;}
+    // D2RR's trailing block. Header flag bit 28 — unused by vanilla D2 — marks
+    // a record that carries a fixed 52-bit block AFTER every property list
+    // (main + set bonus + runeword):
+    //     [16-bit unknown][32-bit acquisition time][4 zero bits]
+    // The 32-bit field is Unix time in MINUTES: across the reference stash its
+    // 46 records span 2026-08-08 to 2026-09-19 and cluster into play sessions
+    // minutes apart, which is what named it. The leading 16 bits are constant
+    // per item class in the sample (3060 for every rin/amu) and are not
+    // decoded here; the block is skipped whole.
+    //
+    // Measured, not guessed. Flag bit 28 separates the two populations exactly
+    // — set on 45/45 records that read short, clear on all 2555 that do not —
+    // and the size is a sharp optimum: walking every page on primary lengths
+    // alone closes 48 of 78, adding 52 bits on bit-28 records closes 52, while
+    // every neighbouring width from 44 to 61 bits closes at most 51. The four
+    // pages it recovers include the 158-record ring/amulet page, which is why
+    // the "Crafted & Unique Rings & Amulets" sort step found nothing to move.
+    //
+    // Guarded on propListUnreliable because an unplaced list leaves `bit`
+    // meaningless, so there is nothing to append 52 bits to.
+    if(!r.propListUnreliable&&rbL(28,1)){r.d2rrTailBits=52;bit+=52;}
   }catch(e){r.decodeError=e.message;}
   // Expose the final bit position — useful for cascade-delete to know where the parent's
   // binary actually ends, so socketed-child filtering can reject scanner false-positives
@@ -16299,6 +16320,13 @@ function validateSharedStashRecords() {
   const tabs = sharedStashParsed.tabs;
   for (let i = 0; i < tabs.length; i++) {
     const t = tabs[i];
+    // No record tiling fills this page, so its item stream does not decode
+    // sequentially — which is exactly what the client does. See
+    // _ssSolvePageRecords.
+    if (t.boundariesUncertain) {
+      return `page ${i}'s ${t.count} item record(s) do not tile its ${t.sectionEnd - t.jmOff - 4} `
+           + `byte payload — the item stream is desynced`;
+    }
     if (t.pageType !== 0) continue;
     const start = t.jmOff + 4;
     const payload = t.sectionEnd - start;
@@ -16379,6 +16407,7 @@ function _loadSharedStashCore(file, onLoaded) {
         { kind: kindLabel }));
       return;
     }
+    _ssInvalidateRecordCache();
     sharedStashData = buf;
     sharedStashName = file.name;
     sharedStashOpenTab = '';
@@ -16457,6 +16486,475 @@ function _selectStashRecords(candidates, count, isSpecialtyTab) {
   console.warn(`parseSharedStash: page at 0x${(candidates[0]?.byteOffset ?? 0).toString(16)} `
     + `expected ${count} records but placement filtering found ${merged.length}; using unfiltered scan`);
   return candidates.slice(0, count);
+}
+
+// ── Authoritative record boundaries ──────────────────────────────────────
+//
+// The byte-pattern scanner below (see parseSharedStash) cannot be trusted to
+// say where a record ENDS. It matches any 5 bytes with the right bit shape,
+// so it also fires inside a real record's stat bits, and every byte operation
+// derives an item's length from the gap to the next scanner offset. A phantom
+// therefore truncates its neighbour silently.
+//
+// Measured failure (page 1 of a 202-page stash): a phantom `ulb` 32 bytes
+// into a rare Kite Shield made that shield "32 bytes long" instead of 67.
+// Auto Sort then extracted the two halves as two separate items and inserted
+// them into two different tabs, patching position bits over each. The shield
+// came out with zero mods, a neighbouring ring vanished, a set bow appeared
+// out of the desynced bit stream, and the client bailed to character select.
+// The placement filter in _selectStashRecords does not catch this: that
+// phantom decoded to parent=0 / storage=5 like any real stash item.
+//
+// So boundaries are solved instead of guessed, using the two facts the client
+// itself relies on: the page's JM count is exact, and the records tile the
+// payload solid from jmOff+4 to the section's stored end.
+//
+//   primary length = ceil((endBit + 1) / 8), from decodeItemProperties, which
+//   walks the whole bit stream to the 0x1FF property-list terminator. Exact
+//   for 3389 of 3433 extended records in the reference file.
+//
+// When the primary length is unusable (propListUnreliable / decodeError /
+// skippedAdvStack leave endBit meaningless) or leads nowhere, a constrained
+// forward search supplies candidates and backtracking picks the assignment
+// that consumes exactly `count` records and lands exactly on sectionEnd.
+// Verified: 201/201 pages tile exactly on the reference file.
+//
+// Candidates are gated cheaply first (huffman type code + placement bits) and
+// only survivors pay for a property decode — the decode is ~170us, and there
+// are up to 400 offsets to consider per ambiguous record.
+const SS_REC_MIN_LEN = 9;     // smallest compact record observed
+// Measured over the 2878 records on the reference file's 183 pages whose
+// forward walk lands exactly on sectionEnd (so every length is the decoder's
+// own, not a search result): min 37, median 57, p99 76, max 86, nothing above
+// 89. 130 leaves headroom for the long tail this file happens not to contain
+// (runewords with many sockets, set items carrying five bonus lists).
+//
+// The cap matters more than it looks. Without it the search closes a page by
+// declaring its last record 316 bytes long, swallowing the real records that
+// follow it — and then anything trusting that span relocates or deletes live
+// item data. A span over the cap means the tiling is wrong, not that the
+// record is big.
+const SS_REC_MAX_LEN = 130;
+// Every compact record in a Reimagined .d2i measures 27 bytes — see primaryLen.
+const SS_COMPACT_REC_LEN = 27;
+// Raised from 4000 once lenCandidates started offering alternates: the extra
+// branching exhausted the old cap on the biggest page (158 records), which made
+// a perfectly good page look untileable and cost the save gate its baseline.
+const SS_SOLVE_NODE_CAP = 60000;
+// The loose pass runs only for the pages the exact pass cannot close, and it
+// runs the plain primary+scan algorithm, so its budget stays modest.
+const SS_SOLVE_NODE_CAP_LOOSE = 60000;
+
+// Per-page boundary cache. An authoritative walk has to decode every item's
+// property list, which costs ~600ms for a 3500-item stash — fine once on load,
+// ruinous for Auto Sort, which re-parses after every splice. Keyed on the
+// page's own payload bytes and holding offsets RELATIVE to the payload start,
+// so a page whose bytes did not change still hits after every other page has
+// shifted underneath it.
+let _ssRecCache = new Map();
+
+// A record's length belongs to the RECORD, not to the page it happens to sit on.
+// That distinction matters because the sort relocates records: a length worked
+// out on the page an item came from is still its length on the page it lands on.
+//
+// Without this the sort defeated itself. It groups by category, so the records
+// whose length only the one-relaxed pass can pin — they are a particular item
+// class — all landed on the same destination pages. One such record per page is
+// solvable; several are not, so pages that parsed fine at load came back locked
+// after the first step, and a category could end up reporting 0 items moved. A
+// real run locked 14 tabs where the file itself only had 3.
+//
+// Keyed on a hash of the record's leading bytes with the position field left
+// out, since that is the one part the sort rewrites (_patchItemPosition touches
+// bits 35-52, i.e. bytes 4-6). Collisions only ever propose a length, which the
+// next-header check still has to accept, so a stale or wrong entry cannot make
+// the solver cut a record.
+let _ssKnownRecLen = new Map();
+
+const SS_REC_FINGERPRINT_BYTES = 20;
+
+function _ssRecFingerprint(buf, off) {
+  if (off + SS_REC_FINGERPRINT_BYTES > buf.length) return 0;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < SS_REC_FINGERPRINT_BYTES; i++) {
+    if (i >= 4 && i <= 6) continue;   // parent / equipSlot / x / y / storage
+    h ^= buf[off + i];
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h;
+}
+
+function _ssInvalidateRecordCache() { _ssRecCache = new Map(); _ssKnownRecLen = new Map(); }
+
+// FNV-1a over the payload. Cheap enough to run for every page on every
+// re-parse (~1ms for the whole file) and only has to distinguish a page from
+// its own edited self.
+function _ssPayloadHash(buf, start, end) {
+  let h = 0x811c9dc5;
+  for (let i = start; i < end; i++) {
+    h ^= buf[i];
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return ((end - start) * 0x01000193 ^ h) >>> 0;
+}
+
+// Solves one page's record boundaries. Returns an array of
+// { byteOffset, recordLen, ...header fields } in stream order, or null when no
+// tiling exists — which means the page's record stream is damaged and callers
+// must not splice bytes in it.
+function _ssSolvePageRecords(buf, jmOff, count, sectionEnd, pageType) {
+  const start = jmOff + 4;
+  if (count === 0) return start === sectionEnd ? [] : null;
+  if (start >= sectionEnd) return null;
+
+  const key = _ssPayloadHash(buf, start, sectionEnd) + ':' + count + ':' + pageType;
+  const cached = _ssRecCache.get(key);
+  if (cached) return cached.map(r => ({ ...r, byteOffset: start + r.rel }));
+
+  const rb = (bo, bs, n) => {
+    let v = 0;
+    for (let i = 0; i < n; i++) { const p = bo * 8 + bs + i; v |= ((buf[p >> 3] >> (p & 7)) & 1) << i; }
+    return v;
+  };
+  const huffAt = (bo, bp) => {
+    let node = D2R_HUFFMAN, b = bp;
+    while (Array.isArray(node)) {
+      const p = bo * 8 + b;
+      node = node[(buf[p >> 3] >> (p & 7)) & 1];
+      b++;
+      if (b - bp > 32) return null;   // runaway: not a real type code
+    }
+    return [node, b];
+  };
+
+  // A record start has to huffman-decode to a known type code AND sit in a
+  // placement the game can represent: a top-level stash item, a socketed
+  // child, or a specialty-page entry. Phantoms reading the middle of someone
+  // else's bit stream almost always fail one of these.
+  const hdrCache = new Map();
+  const hdr = (off) => {
+    if (hdrCache.has(off)) return hdrCache.get(off);
+    let bit = 53, code = '', ok = true;
+    for (let i = 0; i < 4; i++) {
+      const r = huffAt(off, bit);
+      if (!r) { ok = false; break; }
+      if (i < 3) code += (r[0] || '?');
+      bit = r[1];
+    }
+    let h = null;
+    if (ok && code && itemNameByCode[code]) {
+      const parent = rb(off, 35, 3), storage = rb(off, 50, 3);
+      const equipSlot = rb(off, 38, 4), x = rb(off, 42, 4), y = rb(off, 46, 4);
+      const placed = (parent === 0 && storage === 5 && equipSlot === 0 && x < 16 && y < 13)
+                  || (parent === 6 && storage === 0 && equipSlot === 0)
+                  || (parent === 4 && storage === 5);
+      if (placed) h = {
+        byteOffset: off, typeCode: code, bitAfterHuff: bit,
+        identified: rb(off, 4, 1), socketed: rb(off, 11, 1), simple: rb(off, 21, 1),
+        ethereal: rb(off, 22, 1), personalized: rb(off, 24, 1), runeword: rb(off, 26, 1),
+        parent, equipSlot, x, y, storage, location: parent,
+      };
+    }
+    hdrCache.set(off, h);
+    return h;
+  };
+
+  const extCache = new Map();
+  const extOf = (h) => {
+    if (extCache.has(h.byteOffset)) return extCache.get(h.byteOffset);
+    let e = null;
+    try { e = decodeItemProperties(buf, h.byteOffset, h); } catch (_) { e = null; }
+    extCache.set(h.byteOffset, e);
+    return e;
+  };
+
+  // Fields a real record can never carry. quality 0 is not a legal value, and
+  // a socket count without the socketed flag means the read drifted.
+  const contentOk = (h) => {
+    if (h.simple) return true;
+    const e = extOf(h);
+    if (!e || e.decodeError) return false;
+    if (e.skippedAdvStack) return true;
+    if (!(e.quality >= 1 && e.quality <= 9)) return false;
+    if (!h.socketed && e.socketCount > 0) return false;
+    return true;
+  };
+
+  const primaryLen = (h) => {
+    // Compact records are a flat 27 bytes in a Reimagined .d2i, whatever their
+    // item class. Verified byte-exactly on four of them — the next record's
+    // header (or the page end) lands at +27 every time:
+    //   r09 @13100, gmd @85343, r04 @99715, r08 @210742
+    // encodeCompactItem's tail rules produce 9-11 bytes instead, which is the
+    // right answer for a character .d2s but wrong here; using it stalled the
+    // walk on every page holding a gem, rune or socketed child. If 27 is ever
+    // wrong the next-header check below rejects it and the search takes over.
+    if (h.simple) return SS_COMPACT_REC_LEN;
+    const e = extOf(h);
+    if (!e || e.simple || e.decodeError || e.propListUnreliable || e.skippedAdvStack) return 0;
+    return Math.ceil((e.endBit + 1) / 8);
+  };
+
+  // Lengths that are each the end of an actual terminating bit walk, for the
+  // records primaryLen gives up on. Two things go wrong there, and both have a
+  // principled set of answers rather than a range to scan:
+  //
+  //   * The property list sits past D2RR's extra header block but the decoder
+  //     placed it before (or one bit off). Re-reading at base +/- that block
+  //     recovers it — measured as the true start on xtu@10796, tkf@143987,
+  //     sbw@189555, lbw@210630 and ned@89603.
+  //   * More lists follow the main one than the item's quality accounts for
+  //     (set bonus / runeword lists), so the walk stops early. Chaining further
+  //     lists off the end covers that — ned@89603 needs exactly one.
+  //
+  // Every candidate here terminated on a real 0x1FF sentinel, so one that also
+  // lands on a valid next header is worlds apart from an arbitrary offset that
+  // happens to tile. Ordered nearest-first; the caller validates each.
+  const candCache = new Map();
+  const lenCandidates = (h) => {
+    if (candCache.has(h.byteOffset)) return candCache.get(h.byteOffset);
+    const out = [];
+    const e = extOf(h);
+    const base = e && e.mainPropListStartBit;
+    if (base) {
+      const seen = new Set();
+      const starts = [];
+      for (const d of [0, -1, 1]) {
+        starts.push(base + D2RR_EXTRA_HEADER_BITS + d);
+        starts.push(base + d);
+        starts.push(base - D2RR_EXTRA_HEADER_BITS + d);
+      }
+      // Seeds: each alternate main-list placement, plus the decoder's own final
+      // bit (which already has the set-bonus / runeword lists it did read on the
+      // end of it — xsk@96217 needs exactly one more list chained off that).
+      const seeds = [];
+      for (const s of starts) {
+        if (s < 60) continue;
+        let pl;
+        try { pl = _readPropListAt(buf, h.byteOffset, s); } catch (_) { continue; }
+        if (pl && pl.terminated) seeds.push(pl.endBit);
+      }
+      if (e.endBit > 0) seeds.push(e.endBit);
+      // The records that used to read 6-7 bytes short here are gone: the block
+      // behind it is D2RR's 52-bit trailing block, and decodeItemProperties now
+      // accounts for it directly (see the flag-bit-28 note there), so primaryLen
+      // is simply right on them. Offering it as a candidate never worked —
+      // primaryLen's short answer happened to pass the next-header check, so the
+      // solver committed before it ever reached this list.
+      for (const seed of seeds) {
+        let bit = seed;
+        for (let chain = 0; chain <= 4; chain++) {
+          const L = Math.ceil((bit + 1) / 8);
+          if (L >= SS_REC_MIN_LEN && L <= SS_REC_MAX_LEN && !seen.has(L)) { seen.add(L); out.push(L); }
+          let nx;
+          try { nx = _readPropListAt(buf, h.byteOffset, bit); } catch (_) { break; }
+          if (!nx || !nx.terminated) break;
+          bit = nx.endBit;
+        }
+      }
+    }
+    // A length already established for this exact record on some other page
+    // goes first: it was derived, not guessed, and the record's bytes have not
+    // changed since.
+    const known = _ssKnownRecLen.get(_ssRecFingerprint(buf, h.byteOffset));
+    out.sort((a, b) => a - b);
+    if (known >= SS_REC_MIN_LEN && !out.includes(known)) out.unshift(known);
+    else if (known >= SS_REC_MIN_LEN) {
+      const i = out.indexOf(known);
+      if (i > 0) { out.splice(i, 1); out.unshift(known); }
+    }
+    candCache.set(h.byteOffset, out);
+    return out;
+  };
+
+  // Two passes, not one interleaved search. `loose` off, only lengths that came
+  // out of a real bit walk are offered; with it on, the byte-range scan is
+  // available too. Interleaving them cost correctness AND time: the recursion
+  // spent its whole node budget deep in candidate branches and never reached
+  // the scan, so the biggest page (158 records) went from "solved, locked" to
+  // "no tiling at all" — which reads as damage and costs the save gate its
+  // baseline. Separated, the exact pass is cheap and the scan is a clean
+  // second attempt for the pages that need it.
+  let nodes = 0, loose = false, cap = SS_SOLVE_NODE_CAP;
+  const solve = (off, left) => {
+    if (++nodes > cap) return null;
+    if (left === 0) return off === sectionEnd ? [] : null;
+    if (off >= sectionEnd) return null;
+    const h = hdr(off);
+    if (!h) return null;
+    const pl = primaryLen(h);
+    // Fast path: trust the decoder's own end bit whenever the next offset
+    // still looks like a record start (hdr already enforces placement).
+    if (pl >= SS_REC_MIN_LEN && off + pl <= sectionEnd
+        && (left > 1 ? !!hdr(off + pl) : off + pl === sectionEnd)) {
+      const rest = solve(off + pl, left - 1);
+      if (rest) return [{ h, recordLen: pl, exact: true }].concat(rest);
+    }
+    // Second: lengths the bit walk itself produced from an alternate property
+    // list placement. Still exact — each one ended on a 0x1FF sentinel. Tried
+    // whether or not primaryLen answered, because when it answers short (7
+    // bytes, on the records whose list sits past D2RR's block) its own value is
+    // the one that has to be overruled.
+    // Exact pass only. Mixing candidates into the loose pass made things worse,
+    // not better: on the 158-record page a candidate that passed the next-header
+    // check but was wrong put the previously-reachable scan solution behind an
+    // astronomically large subtree, so the page went from "solved, locked" to
+    // untileable — and untileable reads as damage and disables the save gate.
+    // Keeping the passes on separate algorithms means the candidate work can
+    // only ever add fully-exact pages, never take a page away.
+    if (!loose) {
+      for (const L of lenCandidates(h)) {
+        if (off + L > sectionEnd) break;
+        if (L === pl) continue;
+        if (left > 1 ? !hdr(off + L) : off + L !== sectionEnd) continue;
+        const rest = solve(off + L, left - 1);
+        if (rest) return [{ h, recordLen: L, exact: true }].concat(rest);
+      }
+    }
+    // The last record has to close the page exactly, so its length is forced
+    // rather than searched — but only if the forced value is a plausible record
+    // size. An implausible one means an earlier length was wrong, so the caller
+    // backtracks instead of accepting a record that swallows its neighbours.
+    if (left === 1) {
+      const l = sectionEnd - off;
+      // A page holding exactly one record pins that record's length by the
+      // tiling invariant alone — the payload IS the record, with nothing to
+      // choose between. That is arithmetic, not a search, so it counts as exact
+      // and the page stays editable. Closing a MULTI-record page this way is a
+      // guess, because a wrong length earlier in the page lands here looking
+      // just as valid, so it is only offered on the loose pass.
+      if (l >= SS_REC_MIN_LEN && l <= SS_REC_MAX_LEN && l !== pl
+          && (count === 1 || loose)) {
+        return [{ h, recordLen: l, exact: count === 1 }];
+      }
+      return null;
+    }
+    if (!loose) return null;
+    for (let L = SS_REC_MIN_LEN; L <= SS_REC_MAX_LEN && off + L + SS_REC_MIN_LEN <= sectionEnd; L++) {
+      if (L === pl) continue;
+      const nh = hdr(off + L);
+      if (!nh) continue;              // cheap gate
+      if (!contentOk(nh)) continue;   // expensive gate, survivors only
+      const rest = solve(off + L, left - 1);
+      if (rest) return [{ h, recordLen: L, exact: false }].concat(rest);
+    }
+    return null;
+  };
+
+  let sol = solve(start, count);
+
+  // Middle pass: one record's length relaxed, and only if the page pins it.
+  //
+  // Some records carry a tail the decoder cannot account for — measured at ~59
+  // bits on spt@26368 and ~60 on xsk@96217, and it is not a property list: no
+  // start bit anywhere near ends one on the record boundary. Rather than guess
+  // at that structure, let the page name the length: walk exact until stuck,
+  // try every plausible length at the stuck record, and require the REST of the
+  // page to close on exact lengths alone. If one and only one length does that,
+  // it is determined, not guessed — this is exactly how the reference lengths
+  // (xtu=54, ned=63, tkf=70, sbw=52, lbw=44, spt=65, xsk=74) were established,
+  // and each one later matched the independent tiling. Two or more candidates
+  // and it stays a guess, so the page falls through to the loose pass.
+  if (!sol) {
+    let off = start, left = count;
+    while (left > 0) {
+      const h = hdr(off);
+      if (!h) break;
+      const pl = primaryLen(h);
+      let step = 0;
+      if (pl >= SS_REC_MIN_LEN && off + pl <= sectionEnd
+          && (left > 1 ? !!hdr(off + pl) : off + pl === sectionEnd)) step = pl;
+      else for (const L of lenCandidates(h)) {
+        if (off + L > sectionEnd) break;
+        if (left > 1 ? !hdr(off + L) : off + L !== sectionEnd) continue;
+        step = L; break;
+      }
+      if (!step) break;
+      off += step; left--;
+    }
+    if (left > 0 && off < sectionEnd && hdr(off)) {
+      const stuckAt = off, stuckLeft = left;
+      const found = [];
+      for (let L = SS_REC_MIN_LEN; L <= SS_REC_MAX_LEN && stuckAt + L <= sectionEnd; L++) {
+        if (stuckLeft > 1 ? !hdr(stuckAt + L) : stuckAt + L !== sectionEnd) continue;
+        nodes = 0;
+        const rest = stuckLeft > 1 ? solve(stuckAt + L, stuckLeft - 1) : [];
+        if (rest) { found.push({ L, rest }); if (found.length > 1) break; }
+      }
+      if (found.length === 1) {
+        const head = [];
+        let o = start, n = count - stuckLeft;
+        // Re-derive the exact prefix the same way the walk above did.
+        while (n-- > 0) {
+          const h = hdr(o);
+          const pl = primaryLen(h);
+          let step = 0;
+          const isLast = (o === stuckAt);
+          if (pl >= SS_REC_MIN_LEN && o + pl <= sectionEnd && !!hdr(o + pl)) step = pl;
+          else for (const L of lenCandidates(h)) {
+            if (o + L > sectionEnd) break;
+            if (!hdr(o + L)) continue;
+            step = L; break;
+          }
+          head.push({ h, recordLen: step, exact: true });
+          o += step;
+        }
+        const stuckH = hdr(stuckAt);
+        sol = head.concat([{ h: stuckH, recordLen: found[0].L, exact: true }], found[0].rest);
+      }
+    }
+  }
+
+  if (!sol) { loose = true; nodes = 0; cap = SS_SOLVE_NODE_CAP_LOOSE; sol = solve(start, count); }
+  if (!sol) return null;
+
+  // recordLen is the span the tiling assigned, which for the last record on a
+  // page that carries trailing dead space is the record PLUS that slack. Moving
+  // an item must not drag the slack with it — reinserted, the junk lands between
+  // two records and desyncs the destination page's stream. So the record's own
+  // length is tracked separately: the decoder's end bit when it is available and
+  // fits inside the span, else the span itself.
+  // The span IS the record, for every record including the last. Measured on
+  // the reference file: all 183 pages whose forward walk succeeds land exactly
+  // on sectionEnd with zero bytes left over, so pages carry no trailing slack
+  // and there is nothing to trim. An earlier version treated the tail as slack
+  // and cut it on removal, which deleted 375 bytes of real item records off two
+  // pages — the end bit is NOT a second opinion worth having here, because it
+  // reads 6-7 bytes short on items whose property list sits past D2RR's extra
+  // header block.
+  const recs = sol.map(s => ({
+    ...s.h,
+    recordLen: s.recordLen,
+    trueLen: s.recordLen,
+    lenExact: s.exact,
+    numSockets: 0, itemLevel: 0, quality: 0,
+    isSharedStash: true, _propsDecoded: false,
+  }));
+  // A tiling that fits is not the same as a tiling that is right. Where the
+  // decoder could not supply a length, the search picked one that happens to
+  // close the page — and a wrong pick both mis-sizes that record and shifts
+  // every offset after it. Tightening the search is not a fix: three rounds of
+  // it each left a handful of records still cut (4 items mangled and 16 grid
+  // overlaps on the last attempt), because nothing in "it tiles" distinguishes
+  // the right assignment from a plausible one.
+  //
+  // So a page that needed any guess is readable but not spliceable, and the
+  // sort leaves it alone. On the reference file that is 18 of 201 pages; the
+  // other 183 walk end to end on decoder lengths alone and sort normally.
+  // Shrinking those 18 is a matter of making primaryLen cover what it currently
+  // cannot — compact gem/rune records, and the property-list placement that
+  // reads 6-7 bytes short on some items — not of guessing better.
+  const anyGuessed = recs.some(r => !r.lenExact);
+  if (anyGuessed) for (const rec of recs) rec.pageLengthsGuessed = true;
+  else for (const rec of recs) {
+    // Remember every length this page established, so the same record is still
+    // measurable after the sort moves it somewhere else. Only from a page that
+    // came out wholly exact — a guessed tiling must not seed the cache.
+    const fp = _ssRecFingerprint(buf, rec.byteOffset);
+    if (fp) _ssKnownRecLen.set(fp, rec.recordLen);
+  }
+  _ssRecCache.set(key, recs.map(r => ({ ...r, rel: r.byteOffset - start })));
+  return recs;
 }
 
 // Locates every item-bearing section's "JM" marker by walking the page chain
@@ -16591,6 +17089,37 @@ function parseSharedStash() {
     // catch those: huffman + itemNameByCode validation up front, and a hard
     // stop at `count` items per section's JM header below — D2's per-section
     // count is authoritative, so anything found past that is dead-space junk.
+    // Solved boundaries first — see _ssSolvePageRecords. The scan below is
+    // only reached when no tiling exists, i.e. the page's record stream is
+    // already damaged, and then the page is flagged so byte-splicing code can
+    // refuse to touch it.
+    const solved = _ssSolvePageRecords(buf, jmOff, count, sectionEnd, pageType);
+    if (solved) {
+      if (isSpecialtyTab) for (const it of solved) {
+        // Reimagined's AdvancedStashStackable per-item quantity — see the
+        // scanner path below for the bit layout and why 0 is not clamped to 1.
+        it.advancedQty = 1;
+        if (it.simple) {
+          try {
+            const q = rb(it.byteOffset, it.bitAfterHuff + 2, 9);
+            it.advancedQty = (q < 0 || q > 511) ? 0 : q;
+          } catch (_) { it.advancedQty = 0; }
+        }
+      } else for (const it of solved) it.advancedQty = 1;
+      // lengthsGuessed: the tiling closed the page but not every length came
+      // from the decoder, so offsets in it are not trustworthy enough to cut
+      // at. Distinct from boundariesUncertain below, which means the page is
+      // actually damaged — this page reads fine, it just cannot be edited.
+      const lengthsGuessed = solved.some(it => it.pageLengthsGuessed);
+      if (lengthsGuessed) {
+        console.warn(`parseSharedStash: page at 0x${jmOff.toString(16)} tiles only with `
+          + `${solved.filter(it => !it.lenExact).length} searched record length(s); `
+          + `readable but excluded from sorting`);
+      }
+      tabs.push({ jmOff, count, items: solved, pageType, sectionEnd, lengthsGuessed });
+      continue;
+    }
+
     const candidates = [];
     for (let i = 0; i < endOff - itemStart - 4; i++) {
       const off = itemStart + i;
@@ -16671,7 +17200,13 @@ function parseSharedStash() {
     // gap smaller than 33 bytes.
     const items = _selectStashRecords(candidates, count, isSpecialtyTab);
 
-    tabs.push({ jmOff, count, items, pageType, sectionEnd });
+    // No tiling existed for this page, so every offset here comes from the
+    // loose scanner and may sit inside a real record. boundariesUncertain is
+    // the flag byte-splicing code checks before it dares cut anything.
+    console.warn(`parseSharedStash: page at 0x${jmOff.toString(16)} has no valid record tiling `
+      + `(${count} items over ${sectionEnd - jmOff - 4} bytes); falling back to the scanner and `
+      + `marking the page unsafe to edit`);
+    tabs.push({ jmOff, count, items, pageType, sectionEnd, boundariesUncertain: true });
   }
 
   sharedStashParsed = { gold, tabs };
@@ -17847,13 +18382,17 @@ function _ssRemoveItemsFromTab(physicalIdx, ranges) {
 //   interior record -> distance to the next record
 //   last record     -> distance to sectionEnd
 //
-// This deliberately no longer consults decodeItemProperties().endBit. That
-// value agrees with the real record boundary only ~16% of the time on this
-// data (its property-list walk desyncs on 84% of items), and it was the reason
-// a relocated last-item record used to be cut short or run into the next page's
-// header. Correct boundaries now come from parseSharedStash's placement filter
-// — see _selectStashRecords.
+// Neither case holds when an offset is wrong, though, and "distance to the
+// next record" is exactly what a scanner phantom poisons: a false start 32
+// bytes into a 67-byte record makes that record measure 32. So the solved
+// length from _ssSolvePageRecords wins whenever it is available — it comes
+// from a tiling that provably fills the page — and the arithmetic below is
+// only the fallback for pages that had no tiling at all.
 function _ssItemTrueLength(buf, item, tabItems, sectionEnd) {
+  // Authoritative: parseSharedStash solved this page's boundaries. trueLen is
+  // the record alone; recordLen may also cover a page's trailing slack.
+  if (item && item.trueLen > 0) return item.trueLen;
+  if (item && item.recordLen > 0) return item.recordLen;
   const nextOffsets = tabItems.map(it => it.byteOffset).filter(o => o > item.byteOffset);
   if (nextOffsets.length) {
     const len = Math.min(...nextOffsets) - item.byteOffset;
@@ -17954,7 +18493,7 @@ function _ssApplySortPlan(plan) {
     // boundary it was handed, so the span still has to be capped here.
     totalLen = Math.min(totalLen, sectionEnd - mi.item.byteOffset);
     const bytes = sharedStashData.slice(mi.item.byteOffset, mi.item.byteOffset + totalLen);
-    extracted.set(p, { bytes, recordCount: 1 + mi.children.length });
+    extracted.set(p, { bytes, removeLen: bytes.length, recordCount: 1 + mi.children.length });
   }
 
   // Step 2 — remove from source tabs, highest physical index first. Removing
@@ -17965,7 +18504,7 @@ function _ssApplySortPlan(plan) {
     const mi = p.mi;
     const ex = extracted.get(p);
     if (!bySourceTab.has(mi.tabIdx)) bySourceTab.set(mi.tabIdx, []);
-    bySourceTab.get(mi.tabIdx).push({ start: mi.item.byteOffset, len: ex.bytes.length, count: ex.recordCount });
+    bySourceTab.get(mi.tabIdx).push({ start: mi.item.byteOffset, len: ex.removeLen, count: ex.recordCount });
   }
   const sourceTabIdxs = [...bySourceTab.keys()].sort((a, b) => b - a);
   for (const tIdx of sourceTabIdxs) {
@@ -18015,11 +18554,22 @@ function _ssApplySortPlan(plan) {
 // tabs do we need" search happens entirely before anything is written and the
 // no-room case fails without having changed a thing.
 function _ssPrepareInPlaceSort(mode, sourceIdxs, destIdxs) {
-  const sources = [...sourceIdxs].sort((a, b) => a - b);
-  if (!sources.length) return { error: 'noSource' };
+  // A page whose record boundaries could not be solved cannot be spliced: any
+  // offset in it may sit inside a real record, and cutting there is what
+  // produced half-items the client refused to load (see _ssSolvePageRecords).
+  // Such a page is dropped from both roles rather than failing the whole run —
+  // its items simply stay where they are, and the caller reports which tabs
+  // were left alone.
+  const isUnsafe = (i) => {
+    const t = sharedStashParsed.tabs[i];
+    return !!(t && (t.boundariesUncertain || t.lengthsGuessed));
+  };
+  const skipped = [...sourceIdxs].filter(isUnsafe).sort((a, b) => a - b);
+  const sources = [...sourceIdxs].filter(i => !isUnsafe(i)).sort((a, b) => a - b);
+  if (!sources.length) return { error: 'noSource', skipped };
   const sourceSet = new Set(sources);
   const dests = [...new Set(destIdxs)].filter(i => sourceSet.has(i)).sort((a, b) => a - b);
-  if (!dests.length) return { error: 'noDest' };
+  if (!dests.length) return { error: 'noDest', skipped };
   const lastDest = dests[dests.length - 1];
 
   // Only empty tabs BEHIND the last target are eligible: those are the ones
@@ -18046,12 +18596,12 @@ function _ssPrepareInPlaceSort(mode, sourceIdxs, destIdxs) {
     parts = split(nSort, nStray);
     plan = _ssPlanSort(sources, [...dests, ...parts.sortExtras], mode, parts.strayTabs);
   }
-  if (plan.empty) return { error: 'empty' };
+  if (plan.empty) return { error: 'empty', skipped };
   if (!plan.ok) {
-    return { error: plan.needsStrayTab ? 'noStrayTab' : 'noRoom', borrowed: nSort + nStray };
+    return { error: plan.needsStrayTab ? 'noStrayTab' : 'noRoom', borrowed: nSort + nStray, skipped };
   }
   return { plan, extras: parts.extras, sortExtras: parts.sortExtras, strayTabs: parts.strayTabs,
-           sources, dests, lastDest, mode };
+           sources, dests, lastDest, mode, skipped };
 }
 
 // opts.keepStraysAtEnd — leave the borrowed stray tabs at the far end of the
@@ -18490,6 +19040,7 @@ function _ssRunAutoSort() {
   const layout = _ssAutoSortLayout();
   const steps = [];
   const failures = [];
+  const unsafeTabs = new Set();
 
   // Reserved tabs can't be reserved if they don't exist. Clamping rather than
   // failing keeps a stale startTab from bricking the button on a small stash.
@@ -18556,12 +19107,31 @@ function _ssRunAutoSort() {
     // sitting blank exactly where the layout wants them. Only a quota that
     // runs off the end of the stash comes up short here, and the padding pass
     // picks that up along with the categories that had nothing to sort.
-    const dests = regular.slice(cursor, cursor + spec.minTabs);
+    // A tab whose record boundaries had to be searched cannot be spliced (see
+    // _ssSolvePageRecords), so it is stepped over rather than handed to a
+    // category: one locked tab inside a category's slot range used to empty the
+    // destination list and stop the whole run. Its own items stay where they
+    // are, and the category takes the next usable slots instead.
+    const dests = [];
+    let scan = cursor;
+    while (dests.length < spec.minTabs && scan < regular.length) {
+      const t = sharedStashParsed.tabs[regular[scan]];
+      if (!(t && (t.boundariesUncertain || t.lengthsGuessed))) dests.push(regular[scan]);
+      scan++;
+    }
+    const lockedSkipped = (scan - cursor) - dests.length;
+    for (let s = cursor; s < scan; s++) {
+      const t = sharedStashParsed.tabs[regular[s]];
+      if (t && (t.boundariesUncertain || t.lengthsGuessed)) unsafeTabs.add(regular[s]);
+    }
 
     // Reserved tabs are not sources either: an item of this category sitting
     // in one must be left exactly where the user put it, not dragged into the
     // layout.
     const res = _ssPrepareInPlaceSort(mode, regular.slice(startTab), dests);
+    // Pages whose record boundaries could not be solved are left out of every
+    // step; collect them once so the run can say which tabs it never touched.
+    if (res.skipped) for (const i of res.skipped) unsafeTabs.add(i);
 
     // Nothing of this category anywhere in the stash, so there is nothing to
     // sort and no target tabs get reserved. Its quota is not forfeited — the
@@ -18589,7 +19159,10 @@ function _ssRunAutoSort() {
       continue;
     }
 
-    const span = dests.length + res.sortExtras.length;
+    // The cursor has to clear the locked tabs this category stepped over as
+    // well as the slots it actually used, or the next category would try to
+    // start on one of them again.
+    const span = dests.length + res.sortExtras.length + lockedSkipped;
     steps.push({ ...stepInfo, items: _ssPlanSortedItemCount(res.plan), tabs: span,
                  strayTabs: res.strayTabs.length });
     spans.push({ spec, mode, tabs: span, end: cursor + span });
@@ -18649,7 +19222,12 @@ function _ssRunAutoSort() {
     }
   }
 
-  return { steps, padding, blanks, failures, failed: null, startTab };
+  if (unsafeTabs.size) {
+    console.warn('Auto sort left these tabs untouched — no solvable record boundaries: '
+      + [...unsafeTabs].map(i => i + 1).join(', '));
+  }
+  return { steps, padding, blanks, failures, failed: null, startTab,
+           unsafeTabs: [...unsafeTabs].sort((a, b) => a - b) };
 }
 
 // Pulls `n` empty tabs to the front of the layout: after the tabs startTab
@@ -18791,6 +19369,10 @@ function _ssAutoSortFailureText(f) {
         'The reserved tabs hold items this category does not sort, and there is no empty tab left at the end of the stash to move them into.');
     case 'noSlots':
       return L('ui_ss_auto_fail_slots', 'The stash ran out of tabs before this category got its turn.');
+    case 'unsafePage':
+      return Lfmt('ui_ss_auto_fail_unsafe',
+        'Skipped: tab(s) {tabs} hold an item stream this editor cannot map to exact record boundaries, so moving items out of them could cut a record in half. Those tabs were left untouched.',
+        { tabs: (f.unsafe || []).map(i => i + 1).join(', ') });
     case 'reverted':
       return Lfmt('ui_ss_auto_fail_reverted', 'The step failed and was rolled back. ({detail})',
         { detail: f.detail || '' });
@@ -18869,6 +19451,14 @@ window.ssAutoSortRun = function() {
     if (skipped.length) {
       out += '\n\n' + Lfmt('ui_ss_auto_skipped', 'Nothing found for: {list} — their tabs were left blank.',
         { list: skipped.map(s => s.label).join(', ') });
+    }
+    // Tabs the run stepped over because their item records cannot be located
+    // exactly — see _ssSolvePageRecords. Worth saying out loud: the user would
+    // otherwise just see items that refused to move.
+    if (run.unsafeTabs && run.unsafeTabs.length) {
+      out += '\n\n' + Lfmt('ui_ss_auto_locked',
+        'Left untouched: tab(s) {list}. This editor cannot pin down where each item record ends on them, so moving items out could cut one in half. Their contents are unchanged.',
+        { list: run.unsafeTabs.map(i => i + 1).join(', ') });
     }
     // With continueOnFailure the run keeps going past a bad step, so the
     // headline above describes a completed run and these are the casualties.
